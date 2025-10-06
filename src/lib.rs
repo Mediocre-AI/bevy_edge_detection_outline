@@ -248,7 +248,6 @@ fn init_post_process_pipeline(
 
     // Get the shader handle
     let shader = asset_server.load(SHADER_ASSET_PATH);
-    // let shader = load_embedded_asset!(&*asset_server, "/src/edge_detection_shader.wgsl");
     // This will setup a fullscreen triangle for the vertex state.
     let vertex_state = fullscreen_shader.to_vertex_state();
     let pipeline_id = pipeline_cache
