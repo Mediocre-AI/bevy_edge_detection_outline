@@ -1,5 +1,7 @@
 /target*
 assets/*
+!assets/shaders/
+!assets/shaders/*.wgsl
 # Logs
 logs
 *.log
