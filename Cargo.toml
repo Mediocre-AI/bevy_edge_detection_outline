@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+
+members = ["app"]
+
+# Enable a small amount of optimization in the dev profile.
+[profile.dev]
+opt-level = 1
+
+# Enable a large amount of optimization in the dev profile for dependencies.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Enable more optimization in the release profile at the cost of compile time.
+[profile.release]
+codegen-units = 1 # Compile the entire crate as one unit. Slows compile times, marginal improvements.
+lto           = "thin" # Do a second optimization pass over the entire program, including dependencies. Slows compile times, marginal improvements.
+
+# Optimize for size in the wasm-release profile to reduce load times and bandwidth usage on web.
+[profile.wasm-release]
+inherits = "release"
+opt-level     = 2        # faster than "s", still optimized
+lto           = false    # keep it off
+codegen-units = 4        # split the work into more parallel units
+incremental   = true     # re-enable incremental (won’t work with LTO)
+strip         = "debuginfo"
+

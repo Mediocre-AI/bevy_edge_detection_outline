@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Verifiable Rewards Web</title>
+    <style>
+      canvas {
+        background-color: white;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="start-btn">Start Game</button>
+    <script type="module">
+      import init from './target/app.js';
+      
+      const startButton = document.getElementById('start-btn');
+      
+      function startApplication() {
+        init();
+        startButton.style.display = 'none';
+      }
+      
+      // Click event
+      startButton.addEventListener('click', startApplication);
+      
+      // Keyboard event for Enter key
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          startApplication();
+        }
+      });
+    </script>
+  </body>
+</html>
