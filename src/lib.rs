@@ -93,6 +93,7 @@ pub struct EdgeDetectionPipeline {
     pub shader: Handle<Shader>,
     pub noise_texture: Handle<Image>,
     pub linear_sampler: Sampler,
+    pub nonfiltering_sampler: Sampler,
     pub noise_sampler: Sampler,
     pub layout_with_msaa: BindGroupLayout,
     pub layout_without_msaa: BindGroupLayout,
@@ -129,8 +130,10 @@ impl FromWorld for EdgeDetectionPipeline {
                     texture_depth_2d_multisampled(),
                     // normal prepass
                     texture_2d_multisampled(TextureSampleType::Float { filterable: false }),
-                    // texture sampler
+                    // filtering sampler for color/normal
                     sampler(SamplerBindingType::Filtering),
+                    // non-filtering sampler for depth prepass
+                    sampler(SamplerBindingType::NonFiltering),
                     // perlin-noise texture
                     texture_2d(TextureSampleType::Float { filterable: true }),
                     // perlin-noise sampler
@@ -157,6 +160,8 @@ impl FromWorld for EdgeDetectionPipeline {
                     texture_2d(TextureSampleType::Float { filterable: true }),
                     // texture sampler
                     sampler(SamplerBindingType::Filtering),
+                    // for depth
+                    sampler(SamplerBindingType::NonFiltering),
                     // perlin-noise texture
                     texture_2d(TextureSampleType::Float { filterable: true }),
                     // perlin-noise sampler
@@ -175,6 +180,12 @@ impl FromWorld for EdgeDetectionPipeline {
             min_filter: FilterMode::Linear,
             ..default()
         });
+        let nonfiltering_sampler = render_device.create_sampler(&SamplerDescriptor {
+            label: Some("edge detection nonfiltering sampler"),
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            ..default()
+        });
 
         let noise_sampler = render_device.create_sampler(&SamplerDescriptor {
             label: Some("edge detection noise sampler"),
@@ -189,6 +200,7 @@ impl FromWorld for EdgeDetectionPipeline {
             shader,
             noise_texture,
             linear_sampler,
+            nonfiltering_sampler,
             noise_sampler,
             layout_with_msaa,
             layout_without_msaa,
@@ -597,6 +609,8 @@ impl ViewNode for EdgeDetectionNode {
                 &normal_texture.texture.default_view,
                 // Use simple texture sampler
                 &edge_detection_pipeline.linear_sampler,
+                // nonfiltering sampler for depth
+                &edge_detection_pipeline.nonfiltering_sampler,
                 // Use noise texture
                 &noise_texture.texture_view,
                 // Use noise texture sampler

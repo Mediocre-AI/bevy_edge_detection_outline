@@ -1,6 +1,7 @@
 use std::f32::consts::PI;
 
 use bevy::{
+    anti_alias::smaa::Smaa,
     asset::RenderAssetUsages,
     color::palettes::basic::SILVER,
     core_pipeline::core_3d::graph::Node3d,
@@ -8,20 +9,24 @@ use bevy::{
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
-use bevy_edge_detection_outline::EdgeDetectionPlugin;
+use bevy_edge_detection_outline::{EdgeDetection, EdgeDetectionPlugin};
 use bevy_egui::{EguiContexts, EguiPlugin, egui};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
+        .add_plugins(EdgeDetectionPlugin {
+            // If you wish to apply Smaa anti-aliasing after edge detection,
+            // please ensure that the rendering order of [`EdgeDetectionNode`] is set before [`SmaaNode`].
+            before: Node3d::Smaa,
+        })
         .add_plugins(EguiPlugin::default())
         .add_plugins(PanOrbitCameraPlugin)
-        .add_plugins(EdgeDetectionPlugin::default())
         .add_systems(Startup, (setup, spawn_text))
         .add_systems(
             Update,
-            (rotate.run_if(input_toggle_active(false, KeyCode::Space)),),
+            rotate.run_if(input_toggle_active(false, KeyCode::Space)),
         )
         .run();
 }
@@ -127,6 +132,8 @@ fn setup(
         // [`EdgeDetectionNode`] supports `Msaa``, and you can enable it at any time, for example:
         // Msaa::default(),
         Msaa::Off,
+        EdgeDetection::default(),
+        Smaa::default(),
         // to control camera
         PanOrbitCamera::default(),
     ));
@@ -178,97 +185,3 @@ fn uv_debug_texture() -> Image {
         RenderAssetUsages::RENDER_WORLD,
     )
 }
-
-// fn edge_detection_ui(mut ctx: EguiContexts, mut edge_detection: Single<&mut EdgeDetection>) {
-//     egui::Window::new("Edge Detection Settings").show(ctx.ctx_mut(), |ui| {
-//         ui.vertical(|ui| {
-//             ui.horizontal(|ui| {
-//                 ui.add(egui::Checkbox::new(
-//                     &mut edge_detection.enable_depth,
-//                     "enable_depth",
-//                 ));
-//                 ui.add(
-//                     egui::Slider::new(&mut edge_detection.depth_threshold, 0.0..=8.0)
-//                         .text("depth_threshold"),
-//                 );
-//             });
-
-//             ui.horizontal(|ui| {
-//                 ui.add(egui::Checkbox::new(
-//                     &mut edge_detection.enable_normal,
-//                     "enable_normal",
-//                 ));
-//                 ui.add(
-//                     egui::Slider::new(&mut edge_detection.normal_threshold, 0.0..=8.0)
-//                         .text("normal_threshold"),
-//                 );
-//             });
-
-//             ui.horizontal(|ui| {
-//                 ui.add(egui::Checkbox::new(
-//                     &mut edge_detection.enable_color,
-//                     "enable_color",
-//                 ));
-//                 ui.add(
-//                     egui::Slider::new(&mut edge_detection.color_threshold, 0.0..=8.0)
-//                         .text("color_threshold"),
-//                 );
-//             });
-
-//             ui.add(
-//                 egui::Slider::new(&mut edge_detection.depth_thickness, 0.0..=8.0)
-//                     .text("depth_thickness"),
-//             );
-//             ui.add(
-//                 egui::Slider::new(&mut edge_detection.normal_thickness, 0.0..=8.0)
-//                     .text("normal_thickness"),
-//             );
-//             ui.add(
-//                 egui::Slider::new(&mut edge_detection.color_thickness, 0.0..=8.0)
-//                     .text("color_thickness"),
-//             );
-
-//             ui.add(
-//                 egui::Slider::new(&mut edge_detection.steep_angle_threshold, 0.0..=1.0)
-//                     .text("steep_angle_threshold"),
-//             );
-//             ui.add(
-//                 egui::Slider::new(&mut edge_detection.steep_angle_multiplier, 0.0..=1.0)
-//                     .text("steep_angle_multiplier"),
-//             );
-
-//             ui.horizontal(|ui| {
-//                 ui.add(
-//                     egui::DragValue::new(&mut edge_detection.uv_distortion_frequency.x)
-//                         .range(0.0..=16.0),
-//                 );
-//                 ui.add(
-//                     egui::DragValue::new(&mut edge_detection.uv_distortion_frequency.y)
-//                         .range(0.0..=16.0),
-//                 );
-//                 ui.label("uv_distortion_frequency");
-//             });
-
-//             ui.horizontal(|ui| {
-//                 ui.add(
-//                     egui::DragValue::new(&mut edge_detection.uv_distortion_strength.x)
-//                         .range(0.0..=1.0)
-//                         .fixed_decimals(4),
-//                 );
-//                 ui.add(
-//                     egui::DragValue::new(&mut edge_detection.uv_distortion_strength.y)
-//                         .range(0.0..=1.0)
-//                         .fixed_decimals(4),
-//                 );
-//                 ui.label("uv_distortion_strength");
-//             });
-
-//             let mut color = edge_detection.edge_color.to_srgba().to_f32_array_no_alpha();
-//             ui.horizontal(|ui| {
-//                 egui::color_picker::color_edit_button_rgb(ui, &mut color);
-//                 ui.label("edge_color");
-//             });
-//             edge_detection.edge_color = Color::srgb_from_array(color);
-//         });
-//     });
-// }

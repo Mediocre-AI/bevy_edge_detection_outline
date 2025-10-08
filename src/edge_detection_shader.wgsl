@@ -21,13 +21,14 @@
 @group(0) @binding(2) var normal_prepass_texture: texture_2d<f32>;
 #endif
 
-@group(0) @binding(3) var texture_sampler: sampler;
+@group(0) @binding(3) var filtering_sampler: sampler;
+@group(0) @binding(4) var depth_sampler: sampler;
 
-@group(0) @binding(4) var noise_texture: texture_2d<f32>;
-@group(0) @binding(5) var noise_sampler: sampler;
+@group(0) @binding(5) var noise_texture: texture_2d<f32>;
+@group(0) @binding(6) var noise_sampler: sampler;
 
-@group(0) @binding(6) var<uniform> view: View;
-@group(0) @binding(7) var<uniform> ed_uniform: EdgeDetectionUniform;
+@group(0) @binding(7) var<uniform> view: View;
+@group(0) @binding(8) var<uniform> ed_uniform: EdgeDetectionUniform;
 
 struct EdgeDetectionUniform {
     depth_threshold: f32,
@@ -50,6 +51,8 @@ struct EdgeDetectionUniform {
 // -----------------------
 // View Transformation ---
 // -----------------------
+
+fn saturate(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
 
 /// Retrieve the perspective camera near clipping plane
 fn perspective_camera_near() -> f32 {
@@ -94,7 +97,7 @@ fn prepass_depth(uv: vec2f) -> f32 {
     let pixel_coord = vec2i(uv * texture_size);
     let depth = textureLoad(depth_prepass_texture, pixel_coord, sample_index_i);
 #else
-    let depth = textureSample(depth_prepass_texture, texture_sampler, uv);
+    let depth = textureSample(depth_prepass_texture, depth_sampler, uv);
 #endif
     return depth;
 }
@@ -157,7 +160,7 @@ fn prepass_normal(uv: vec2f) -> vec3f {
     let pixel_coord = vec2i(uv * texture_size);
     let normal = textureLoad(normal_prepass_texture, pixel_coord, sample_index_i);
 #else
-    let normal = textureSample(normal_prepass_texture, texture_sampler, uv);
+    let normal = textureSample(normal_prepass_texture, filtering_sampler, uv);
 #endif
     return normal.xyz;
 }
@@ -200,7 +203,7 @@ fn detect_edge_normal(uv: vec2f, thickness: f32) -> f32 {
 // ----------------------
 
 fn prepass_color(uv: vec2f) -> vec3f {
-    return textureSample(screen_texture, texture_sampler, uv).rgb;
+    return textureSample(screen_texture, filtering_sampler, uv).rgb;
 }
 
 fn color_gradient_x(uv: vec2f, y: f32, thickness: f32) -> vec3f {
@@ -261,6 +264,7 @@ fn fragment(
 
     let sample_uv = in.position.xy * min(texel_size.x, texel_size.y);
     let noise = textureSample(noise_texture, noise_sampler, sample_uv * ed_uniform.uv_distortion.xy);
+
     let uv = in.uv + noise.xy * ed_uniform.uv_distortion.zw;
 
     var edge = 0.0;
