@@ -8,7 +8,7 @@ use bevy::{
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
-use bevy_edge_detection_outline::{PostProcessPlugin, PostProcessSettings};
+use bevy_edge_detection_outline::EdgeDetectionPlugin;
 use bevy_egui::{EguiContexts, EguiPlugin, egui};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
@@ -17,13 +17,12 @@ fn main() {
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(EguiPlugin::default())
         .add_plugins(PanOrbitCameraPlugin)
-        .add_plugins(PostProcessPlugin)
+        .add_plugins(EdgeDetectionPlugin::default())
         .add_systems(Startup, (setup, spawn_text))
         .add_systems(
             Update,
             (rotate.run_if(input_toggle_active(false, KeyCode::Space)),),
         )
-        .add_systems(Update, update_settings)
         .run();
 }
 
@@ -130,10 +129,6 @@ fn setup(
         Msaa::Off,
         // to control camera
         PanOrbitCamera::default(),
-        PostProcessSettings {
-            intensity: 0.02,
-            ..default()
-        },
     ));
 }
 
@@ -152,22 +147,6 @@ fn spawn_text(mut commands: Commands) {
 fn rotate(mut query: Query<&mut Transform, With<Shape>>, time: Res<Time>) {
     for mut transform in &mut query {
         transform.rotate_y(time.delta_secs() / 2.);
-    }
-}
-
-fn update_settings(mut settings: Query<&mut PostProcessSettings>, time: Res<Time>) {
-    for mut setting in &mut settings {
-        let mut intensity = ops::sin(time.elapsed_secs());
-        // Make it loop periodically
-        intensity = ops::sin(intensity);
-        // Remap it to 0..1 because the intensity can't be negative
-        intensity = intensity * 0.5 + 0.5;
-        // Scale it to a more reasonable level
-        intensity *= 0.015;
-
-        // Set the intensity.
-        // This will then be extracted to the render world and uploaded to the GPU automatically by the [`UniformComponentPlugin`]
-        setting.intensity = intensity;
     }
 }
 

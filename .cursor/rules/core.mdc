@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+use bevy 0.17.2 or later

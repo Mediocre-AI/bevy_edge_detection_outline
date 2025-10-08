@@ -1,155 +1,569 @@
 use bevy::{
-    asset::load_embedded_asset,
+    asset::{embedded_asset, load_embedded_asset},
     core_pipeline::{
         FullscreenShader,
-        core_3d::graph::{Core3d, Node3d},
+        core_3d::{
+            DEPTH_TEXTURE_SAMPLING_SUPPORTED,
+            graph::{Core3d, Node3d},
+        },
+        prepass::{DepthPrepass, NormalPrepass, ViewPrepassTextures},
     },
     ecs::query::QueryItem,
     prelude::*,
     render::{
-        RenderApp, RenderStartup,
+        Render, RenderApp, RenderSystems,
         extract_component::{
             ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
             UniformComponentPlugin,
         },
+        render_asset::RenderAssets,
         render_graph::{
             NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
         },
         render_resource::{
-            binding_types::{sampler, texture_2d, uniform_buffer},
+            binding_types::{
+                sampler, texture_2d, texture_2d_multisampled, texture_depth_2d,
+                texture_depth_2d_multisampled, uniform_buffer,
+            },
             *,
         },
         renderer::{RenderContext, RenderDevice},
-        view::ViewTarget,
+        sync_component::SyncComponentPlugin,
+        texture::GpuImage,
+        view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
     },
 };
 
-/// This example uses a shader source file from the assets subdirectory
-const SHADER_ASSET_PATH: &str = "shaders/edge_detection_shader.wgsl";
+// ──────────────────────────────────────────────
+//  Plugin Setup
+// ──────────────────────────────────────────────
+pub struct EdgeDetectionPlugin {
+    pub before: Node3d,
+}
 
-// fn main() {
-//     App::new()
-//         .add_plugins((DefaultPlugins, PostProcessPlugin))
-//         .add_systems(Startup, setup)
-//         .add_systems(Update, (rotate, update_settings))
-//         .run();
-// }
+impl Default for EdgeDetectionPlugin {
+    fn default() -> Self {
+        Self {
+            before: Node3d::Fxaa,
+        }
+    }
+}
 
-/// It is generally encouraged to set up post processing effects as a plugin
-pub struct PostProcessPlugin;
-
-impl Plugin for PostProcessPlugin {
+impl Plugin for EdgeDetectionPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((
-            // The settings will be a component that lives in the main world but will
-            // be extracted to the render world every frame.
-            // This makes it possible to control the effect from the main world.
-            // This plugin will take care of extracting it automatically.
-            // It's important to derive [`ExtractComponent`] on [`PostProcessingSettings`]
-            // for this plugin to work correctly.
-            ExtractComponentPlugin::<PostProcessSettings>::default(),
-            // The settings will also be the data used in the shader.
-            // This plugin will prepare the component for the GPU by creating a uniform buffer
-            // and writing the data to that buffer every frame.
-            UniformComponentPlugin::<PostProcessSettings>::default(),
-        ));
+        embedded_asset!(app, "edge_detection_shader.wgsl");
+        embedded_asset!(app, "perlin_noise.png");
 
+        app.register_type::<EdgeDetection>();
+        app.add_plugins(SyncComponentPlugin::<EdgeDetection>::default())
+            .add_plugins((
+                ExtractComponentPlugin::<EdgeDetectionUniform>::default(),
+                UniformComponentPlugin::<EdgeDetectionUniform>::default(),
+            ));
         // We need to get the render app from the main app
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
-
-        // RenderStartup runs once on startup after all plugins are built
-        // It is useful to initialize data that will only live in the RenderApp
-        render_app.add_systems(RenderStartup, init_post_process_pipeline);
-
         render_app
-            // Bevy's renderer uses a render graph which is a collection of nodes in a directed acyclic graph.
-            // It currently runs on each view/camera and executes each node in the specified order.
-            // It will make sure that any node that needs a dependency from another node
-            // only runs when that dependency is done.
-            //
-            // Each node can execute arbitrary work, but it generally runs at least one render pass.
-            // A node only has access to the render world, so if you need data from the main world
-            // you need to extract it manually or with the plugin like above.
-            // Add a [`Node`] to the [`RenderGraph`]
-            // The Node needs to impl FromWorld
-            //
-            // The [`ViewNodeRunner`] is a special [`Node`] that will automatically run the node for each view
-            // matching the [`ViewQuery`]
-            .add_render_graph_node::<ViewNodeRunner<PostProcessNode>>(
-                // Specify the label of the graph, in this case we want the graph for 3d
-                Core3d,
-                // It also needs the label of the node
-                PostProcessLabel,
+            .init_resource::<SpecializedRenderPipelines<EdgeDetectionPipeline>>()
+            .add_systems(
+                Render,
+                prepare_edge_detection_pipelines.in_set(RenderSystems::Prepare),
             )
+            .add_render_graph_node::<ViewNodeRunner<EdgeDetectionNode>>(Core3d, EdgeDetectionLabel)
             .add_render_graph_edges(
                 Core3d,
-                // Specify the node ordering.
-                // This will automatically create all required node edges to enforce the given ordering.
                 (
-                    Node3d::Tonemapping,
-                    PostProcessLabel,
-                    Node3d::EndMainPassPostProcessing,
+                    Node3d::PostProcessing,
+                    EdgeDetectionLabel,
+                    self.before.clone(),
                 ),
             );
+    }
+
+    fn finish(&self, app: &mut App) {
+        app.sub_app_mut(RenderApp)
+            .init_resource::<EdgeDetectionPipeline>();
+    }
+}
+
+// This contains global data used by the render pipeline. This will be created once on startup.
+#[derive(Resource)]
+pub struct EdgeDetectionPipeline {
+    pub shader: Handle<Shader>,
+    pub noise_texture: Handle<Image>,
+    pub linear_sampler: Sampler,
+    pub noise_sampler: Sampler,
+    pub layout_with_msaa: BindGroupLayout,
+    pub layout_without_msaa: BindGroupLayout,
+    pub fullscreen_shader: FullscreenShader,
+}
+
+impl EdgeDetectionPipeline {
+    pub fn bind_group_layout(&self, multisampled: bool) -> &BindGroupLayout {
+        if multisampled {
+            &self.layout_with_msaa
+        } else {
+            &self.layout_without_msaa
+        }
+    }
+}
+
+impl FromWorld for EdgeDetectionPipeline {
+    fn from_world(world: &mut World) -> Self {
+        let render_device = world.resource::<RenderDevice>();
+
+        // let noise_texture = world.load_asset("embedded://bevy_edge_detection/perlin_noise.png");
+        let shader = load_embedded_asset!(world, "edge_detection_shader.wgsl");
+        let noise_texture = load_embedded_asset!(world, "perlin_noise.png");
+
+        let layout_with_msaa = render_device.create_bind_group_layout(
+            "edge_detection: bind_group_layout with msaa",
+            &BindGroupLayoutEntries::sequential(
+                // The layout entries will only be visible in the fragment stage
+                ShaderStages::FRAGMENT,
+                (
+                    // color attachment
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    // depth prepass
+                    texture_depth_2d_multisampled(),
+                    // normal prepass
+                    texture_2d_multisampled(TextureSampleType::Float { filterable: false }),
+                    // texture sampler
+                    sampler(SamplerBindingType::Filtering),
+                    // perlin-noise texture
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    // perlin-noise sampler
+                    sampler(SamplerBindingType::Filtering),
+                    // view
+                    uniform_buffer::<ViewUniform>(true),
+                    // The uniform that will control the effect
+                    uniform_buffer::<EdgeDetectionUniform>(true),
+                ),
+            ),
+        );
+
+        let layout_without_msaa = render_device.create_bind_group_layout(
+            "edge_detection: bind_group_layout without msaa",
+            &BindGroupLayoutEntries::sequential(
+                // The layout entries will only be visible in the fragment stage
+                ShaderStages::FRAGMENT,
+                (
+                    // color attachment
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    // depth prepass
+                    texture_depth_2d(),
+                    // normal prepass
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    // texture sampler
+                    sampler(SamplerBindingType::Filtering),
+                    // perlin-noise texture
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    // perlin-noise sampler
+                    sampler(SamplerBindingType::Filtering),
+                    // view
+                    uniform_buffer::<ViewUniform>(true),
+                    // The uniform that will control the effect
+                    uniform_buffer::<EdgeDetectionUniform>(true),
+                ),
+            ),
+        );
+
+        let linear_sampler = render_device.create_sampler(&SamplerDescriptor {
+            label: Some("edge detection linear sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..default()
+        });
+
+        let noise_sampler = render_device.create_sampler(&SamplerDescriptor {
+            label: Some("edge detection noise sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            ..default()
+        });
+
+        Self {
+            shader,
+            noise_texture,
+            linear_sampler,
+            noise_sampler,
+            layout_with_msaa,
+            layout_without_msaa,
+            fullscreen_shader: world.resource::<FullscreenShader>().clone(),
+        }
+    }
+}
+
+impl SpecializedRenderPipeline for EdgeDetectionPipeline {
+    type Key = EdgeDetectionKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        let targets = vec![Some(ColorTargetState {
+            format: if key.hdr {
+                ViewTarget::TEXTURE_FORMAT_HDR
+            } else {
+                TextureFormat::bevy_default()
+            },
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        })];
+
+        let mut shader_defs = vec![];
+
+        if key.enable_depth {
+            shader_defs.push("ENABLE_DEPTH".into());
+        }
+
+        if key.enable_normal {
+            shader_defs.push("ENABLE_NORMAL".into());
+        }
+
+        if key.enable_color {
+            shader_defs.push("ENABLE_COLOR".into());
+        }
+
+        if key.multisampled {
+            shader_defs.push("MULTISAMPLED".into());
+        }
+
+        match key.projection {
+            ProjectionType::Perspective => shader_defs.push("VIEW_PROJECTION_PERSPECTIVE".into()),
+            ProjectionType::Orthographic => shader_defs.push("VIEW_PROJECTION_ORTHOGRAPHIC".into()),
+            _ => (),
+        };
+
+        RenderPipelineDescriptor {
+            label: Some("edge_detection: pipeline".into()),
+            layout: vec![self.bind_group_layout(key.multisampled).clone()],
+            vertex: self.fullscreen_shader.to_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                shader_defs,
+                entry_point: Some("fragment".into()),
+                targets,
+            }),
+            primitive: default(),
+            depth_stencil: None,
+            multisample: default(),
+            push_constant_ranges: vec![],
+            zero_initialize_workgroup_memory: false,
+        }
+    }
+}
+
+#[derive(Component, Clone, Copy)]
+pub struct EdgeDetectionPipelineId(CachedRenderPipelineId);
+
+pub fn prepare_edge_detection_pipelines(
+    mut commands: Commands,
+    pipeline_cache: Res<PipelineCache>,
+    mut pipelines: ResMut<SpecializedRenderPipelines<EdgeDetectionPipeline>>,
+    edge_detection_pipeline: Res<EdgeDetectionPipeline>,
+    view_targets: Query<(
+        Entity,
+        &ExtractedView,
+        &EdgeDetection,
+        &Msaa,
+        Option<&Projection>,
+    )>,
+) {
+    for (entity, view, edge_detection, msaa, projection) in view_targets.iter() {
+        let (hdr, multisampled) = (view.hdr, *msaa != Msaa::Off);
+
+        commands
+            .entity(entity)
+            .insert(EdgeDetectionPipelineId(pipelines.specialize(
+                &pipeline_cache,
+                &edge_detection_pipeline,
+                EdgeDetectionKey::new(edge_detection, hdr, multisampled, projection),
+            )));
+    }
+}
+
+// ──────────────────────────────────────────────
+//  Core structs and types
+// ──────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectionType {
+    None,
+    Perspective,
+    Orthographic,
+}
+
+impl From<Option<&Projection>> for ProjectionType {
+    fn from(proj: Option<&Projection>) -> Self {
+        if let Some(projection) = proj {
+            return match projection {
+                Projection::Perspective(_) => Self::Perspective,
+                Projection::Orthographic(_) => Self::Orthographic,
+                Projection::Custom(_) => Self::None,
+            };
+        };
+
+        Self::None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EdgeDetectionKey {
+    /// Whether to enable depth-based edge detection.
+    /// If `true`, edges will be detected based on depth variations.
+    pub enable_depth: bool,
+    /// Whether to enable normal-based edge detection.
+    /// If `true`, edges will be detected based on normal direction variations.
+    pub enable_normal: bool,
+    /// Whether to enable color-based edge detection.
+    /// If `true`, edges will be detected based on color variations.
+    pub enable_color: bool,
+
+    /// Whether we're using HDR.
+    pub hdr: bool,
+    /// Whether the render target is multisampled.
+    pub multisampled: bool,
+    /// The projection type of view
+    pub projection: ProjectionType,
+}
+
+impl EdgeDetectionKey {
+    pub fn new(
+        edge_detection: &EdgeDetection,
+        hdr: bool,
+        multisampled: bool,
+        projection: Option<&Projection>,
+    ) -> Self {
+        Self {
+            enable_depth: edge_detection.enable_depth,
+            enable_normal: edge_detection.enable_normal,
+            enable_color: edge_detection.enable_color,
+
+            hdr,
+            multisampled,
+            projection: projection.into(),
+        }
+    }
+}
+#[derive(Component, Clone, Copy, Debug, Reflect)]
+#[reflect(Component, Default)]
+#[require(DepthPrepass, NormalPrepass)]
+pub struct EdgeDetection {
+    /// Depth threshold, used to detect edges with significant depth changes.
+    /// Areas where the depth variation exceeds this threshold will be marked as edges.
+    pub depth_threshold: f32,
+    /// Normal threshold, used to detect edges with significant normal direction changes.
+    /// Areas where the normal direction variation exceeds this threshold will be marked as edges.
+    pub normal_threshold: f32,
+    /// Color threshold, used to detect edges with significant color changes.
+    /// Areas where the color variation exceeds this threshold will be marked as edges.
+    pub color_threshold: f32,
+
+    /// Thickness of the edges detected based on depth variations.
+    /// This value controls the width of the edges drawn when depth-based edge detection is enabled.
+    /// Higher values result in thicker edges.
+    pub depth_thickness: f32,
+    /// Thickness of the edges detected based on normal direction variations.
+    /// This value controls the width of the edges drawn when normal-based edge detection is enabled.
+    /// Higher values result in thicker edges.
+    pub normal_thickness: f32,
+    /// Thickness of the edges detected based on color variations.
+    /// This value controls the width of the edges drawn when color-based edge detection is enabled.
+    /// Higher values result in thicker edges.
+    pub color_thickness: f32,
+
+    /// Steep angle threshold, used to adjust the depth threshold when viewing surfaces at steep angles.
+    /// When the angle between the view direction and the surface normal is very steep, the depth gradient
+    /// can appear artificially large, causing non-edge regions to be mistakenly detected as edges.
+    /// This threshold defines the angle at which the depth threshold adjustment begins to take effect.
+    ///
+    /// Range: [0.0, 1.0]
+    pub steep_angle_threshold: f32,
+    /// Multiplier applied to the depth threshold when the view angle is steep.
+    /// When the angle between the view direction and the surface normal exceeds the `steep_angle_threshold`,
+    /// the depth threshold is scaled by this multiplier to reduce the likelihood of false edge detection.
+    ///
+    /// A value of 1.0 means no adjustment, while values greater than 1.0 increase the depth threshold,
+    /// making edge detection less sensitive in steep angles.
+    ///
+    /// Range: [0.0, inf)
+    pub steep_angle_multiplier: f32,
+
+    /// Frequency of UV distortion applied to the edge detection process.
+    /// This controls how often the distortion effect repeats across the UV coordinates.
+    /// Higher values result in more frequent distortion patterns.
+    pub uv_distortion_frequency: Vec2,
+
+    /// Strength of UV distortion applied to the edge detection process.
+    /// This controls the intensity of the distortion effect.
+    /// Higher values result in more pronounced distortion.
+    pub uv_distortion_strength: Vec2,
+
+    /// Edge color, used to draw the detected edges.
+    /// Typically a high-contrast color (e.g., red or black) to visually highlight the edges.
+    pub edge_color: Color,
+
+    /// Whether to enable depth-based edge detection.
+    /// If `true`, edges will be detected based on depth variations.
+    pub enable_depth: bool,
+    /// Whether to enable normal-based edge detection.
+    /// If `true`, edges will be detected based on normal direction variations.
+    pub enable_normal: bool,
+    /// Whether to enable color-based edge detection.
+    /// If `true`, edges will be detected based on color variations.
+    pub enable_color: bool,
+}
+
+impl Default for EdgeDetection {
+    fn default() -> Self {
+        Self {
+            depth_threshold: 1.0,
+            normal_threshold: 0.8,
+            color_threshold: 0.1,
+
+            depth_thickness: 1.0,
+            normal_thickness: 1.0,
+            color_thickness: 1.0,
+
+            steep_angle_threshold: 0.00,
+            steep_angle_multiplier: 0.30,
+
+            uv_distortion_frequency: Vec2::splat(1.0),
+            uv_distortion_strength: Vec2::splat(0.004),
+
+            edge_color: Color::BLACK,
+
+            enable_depth: true,
+            enable_normal: true,
+            enable_color: false,
+        }
+    }
+}
+
+#[derive(Component, Clone, Copy, ShaderType)]
+pub struct EdgeDetectionUniform {
+    pub depth_threshold: f32,
+    pub normal_threshold: f32,
+    pub color_threshold: f32,
+
+    pub depth_thickness: f32,
+    pub normal_thickness: f32,
+    pub color_thickness: f32,
+
+    pub steep_angle_threshold: f32,
+    pub steep_angle_multiplier: f32,
+
+    pub uv_distortion: Vec4,
+
+    pub edge_color: LinearRgba,
+}
+
+impl From<&EdgeDetection> for EdgeDetectionUniform {
+    fn from(ed: &EdgeDetection) -> Self {
+        Self {
+            depth_threshold: ed.depth_threshold,
+            normal_threshold: ed.normal_threshold,
+            color_threshold: ed.color_threshold,
+
+            depth_thickness: ed.depth_thickness,
+            normal_thickness: ed.normal_thickness,
+            color_thickness: ed.color_thickness,
+
+            steep_angle_threshold: ed.steep_angle_threshold,
+            steep_angle_multiplier: ed.steep_angle_multiplier,
+
+            uv_distortion: Vec4::new(
+                ed.uv_distortion_frequency.x,
+                ed.uv_distortion_frequency.y,
+                ed.uv_distortion_strength.x,
+                ed.uv_distortion_strength.y,
+            ),
+
+            edge_color: ed.edge_color.into(),
+        }
+    }
+}
+
+impl ExtractComponent for EdgeDetectionUniform {
+    type QueryData = &'static EdgeDetection;
+    type QueryFilter = ();
+    type Out = EdgeDetectionUniform;
+
+    fn extract_component(edge_detection: QueryItem<Self::QueryData>) -> Option<Self::Out> {
+        if !DEPTH_TEXTURE_SAMPLING_SUPPORTED {
+            return None;
+        }
+        Some(EdgeDetectionUniform::from(edge_detection))
     }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct PostProcessLabel;
+pub struct EdgeDetectionLabel;
 
-// The post process node used for the render graph
+// ──────────────────────────────────────────────
+//  Render graph nodes
+// ──────────────────────────────────────────────
+
 #[derive(Default)]
-struct PostProcessNode;
+pub struct EdgeDetectionNode;
 
-// The ViewNode trait is required by the ViewNodeRunner
-impl ViewNode for PostProcessNode {
-    // The node needs a query to gather data from the ECS in order to do its rendering,
-    // but it's not a normal system so we need to define it manually.
-    //
-    // This query will only run on the view entity
+impl ViewNode for EdgeDetectionNode {
     type ViewQuery = (
+        &'static Msaa,
         &'static ViewTarget,
-        // This makes sure the node only runs on cameras with the PostProcessSettings component
-        &'static PostProcessSettings,
-        // As there could be multiple post processing components sent to the GPU (one per camera),
-        // we need to get the index of the one that is associated with the current view.
-        &'static DynamicUniformIndex<PostProcessSettings>,
+        &'static ViewPrepassTextures,
+        &'static ViewUniformOffset,
+        &'static DynamicUniformIndex<EdgeDetectionUniform>,
+        &'static EdgeDetectionPipelineId,
     );
 
-    // Runs the node logic
-    // This is where you encode draw commands.
-    //
-    // This will run on every view on which the graph is running.
-    // If you don't want your effect to run on every camera,
-    // you'll need to make sure you have a marker component as part of [`ViewQuery`]
-    // to identify which camera(s) should run the effect.
     fn run(
         &self,
         _graph: &mut RenderGraphContext,
         render_context: &mut RenderContext,
-        (view_target, _post_process_settings, settings_index): QueryItem<Self::ViewQuery>,
+        (
+            msaa,
+            view_target,
+            prepass_textures,
+            view_uniform_index,
+            ed_uniform_index,
+            edge_detection_pipeline_id,
+        ): QueryItem<Self::ViewQuery>,
         world: &World,
     ) -> Result<(), NodeRunError> {
-        // Get the pipeline resource that contains the global data we need
-        // to create the render pipeline
-        let post_process_pipeline = world.resource::<PostProcessPipeline>();
+        let edge_detection_pipeline = world.resource::<EdgeDetectionPipeline>();
 
-        // The pipeline cache is a cache of all previously created pipelines.
-        // It is required to avoid creating a new pipeline each frame,
-        // which is expensive due to shader compilation.
-        let pipeline_cache = world.resource::<PipelineCache>();
-
-        // Get the pipeline from the cache
-        let Some(pipeline) = pipeline_cache.get_render_pipeline(post_process_pipeline.pipeline_id)
+        let Some(pipeline) = world
+            .resource::<PipelineCache>()
+            .get_render_pipeline(edge_detection_pipeline_id.0)
         else {
             return Ok(());
         };
 
-        // Get the settings uniform binding
-        let settings_uniforms = world.resource::<ComponentUniforms<PostProcessSettings>>();
-        let Some(settings_binding) = settings_uniforms.uniforms().binding() else {
+        let (Some(depth_texture), Some(normal_texture)) =
+            (&prepass_textures.depth, &prepass_textures.normal)
+        else {
+            return Ok(());
+        };
+
+        let Some(noise_texture) = world
+            .resource::<RenderAssets<GpuImage>>()
+            .get(&edge_detection_pipeline.noise_texture)
+        else {
+            return Ok(());
+        };
+
+        let Some(view_uniforms_binding) = world.resource::<ViewUniforms>().uniforms.binding()
+        else {
+            return Ok(());
+        };
+
+        let Some(ed_uniform_binding) = world
+            .resource::<ComponentUniforms<EdgeDetectionUniform>>()
+            .uniforms()
+            .binding()
+        else {
             return Ok(());
         };
 
@@ -169,26 +583,34 @@ impl ViewNode for PostProcessNode {
         // The reason it doesn't work is because each post_process_write will alternate the source/destination.
         // The only way to have the correct source/destination for the bind_group
         // is to make sure you get it during the node execution.
+        let multisampled = *msaa != Msaa::Off;
         let bind_group = render_context.render_device().create_bind_group(
-            "post_process_bind_group",
-            &post_process_pipeline.layout,
+            "edge_detection_bind_group",
+            edge_detection_pipeline.bind_group_layout(multisampled),
             // It's important for this to match the BindGroupLayout defined in the PostProcessPipeline
             &BindGroupEntries::sequential((
                 // Make sure to use the source view
                 post_process.source,
-                // Use the sampler created for the pipeline
-                &post_process_pipeline.sampler,
-                // Set the settings binding
-                settings_binding.clone(),
+                // Use depth prepass
+                &depth_texture.texture.default_view,
+                // Use normal prepass
+                &normal_texture.texture.default_view,
+                // Use simple texture sampler
+                &edge_detection_pipeline.linear_sampler,
+                // Use noise texture
+                &noise_texture.texture_view,
+                // Use noise texture sampler
+                &edge_detection_pipeline.noise_sampler,
+                // view uniform binding
+                view_uniforms_binding,
+                // Set the uniform binding
+                ed_uniform_binding,
             )),
         );
 
-        // Begin the render pass
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("post_process_pass"),
+            label: Some("edge_detection_pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
-                // We need to specify the post process destination view here
-                // to make sure we write to the appropriate texture.
                 view: post_process.destination,
                 depth_slice: None,
                 resolve_target: None,
@@ -199,88 +621,14 @@ impl ViewNode for PostProcessNode {
             occlusion_query_set: None,
         });
 
-        // This is mostly just wgpu boilerplate for drawing a fullscreen triangle,
-        // using the pipeline/bind_group created above
         render_pass.set_render_pipeline(pipeline);
-        // By passing in the index of the post process settings on this view, we ensure
-        // that in the event that multiple settings were sent to the GPU (as would be the
-        // case with multiple cameras), we use the correct one.
-        render_pass.set_bind_group(0, &bind_group, &[settings_index.index()]);
+        render_pass.set_bind_group(
+            0,
+            &bind_group,
+            &[view_uniform_index.offset, ed_uniform_index.index()],
+        );
         render_pass.draw(0..3, 0..1);
 
         Ok(())
     }
-}
-
-// This contains global data used by the render pipeline. This will be created once on startup.
-#[derive(Resource)]
-struct PostProcessPipeline {
-    layout: BindGroupLayout,
-    sampler: Sampler,
-    pipeline_id: CachedRenderPipelineId,
-}
-
-fn init_post_process_pipeline(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    asset_server: Res<AssetServer>,
-    fullscreen_shader: Res<FullscreenShader>,
-    pipeline_cache: Res<PipelineCache>,
-) {
-    // We need to define the bind group layout used for our pipeline
-    let layout = render_device.create_bind_group_layout(
-        "post_process_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
-            // The layout entries will only be visible in the fragment stage
-            ShaderStages::FRAGMENT,
-            (
-                // The screen texture
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                // The sampler that will be used to sample the screen texture
-                sampler(SamplerBindingType::Filtering),
-                // The settings uniform that will control the effect
-                uniform_buffer::<PostProcessSettings>(true),
-            ),
-        ),
-    );
-    // We can create the sampler here since it won't change at runtime and doesn't depend on the view
-    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
-
-    // Get the shader handle
-    let shader = asset_server.load(SHADER_ASSET_PATH);
-    // This will setup a fullscreen triangle for the vertex state.
-    let vertex_state = fullscreen_shader.to_vertex_state();
-    let pipeline_id = pipeline_cache
-        // This will add the pipeline to the cache and queue its creation
-        .queue_render_pipeline(RenderPipelineDescriptor {
-            label: Some("post_process_pipeline".into()),
-            layout: vec![layout.clone()],
-            vertex: vertex_state,
-            fragment: Some(FragmentState {
-                shader,
-                // Make sure this matches the entry point of your shader.
-                // It can be anything as long as it matches here and in the shader.
-                targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::bevy_default(),
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-                ..default()
-            }),
-            ..default()
-        });
-    commands.insert_resource(PostProcessPipeline {
-        layout,
-        sampler,
-        pipeline_id,
-    });
-}
-
-// This is the component that will get passed to the shader
-#[derive(Component, Default, Clone, Copy, ExtractComponent, ShaderType)]
-pub struct PostProcessSettings {
-    pub intensity: f32,
-    // WebGL2 structs must be 16 byte aligned.
-    #[cfg(feature = "webgl2")]
-    pub _webgl2_padding: Vec3,
 }
