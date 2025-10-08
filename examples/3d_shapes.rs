@@ -285,6 +285,8 @@ fn edge_detection_ui(mut ctx: EguiContexts, mut edge_detection: Single<&mut Edge
                 ui.label("edge_color");
             });
             edge_detection.edge_color = Color::srgb_from_array(color);
+
+            ui.add(egui::Slider::new(&mut edge_detection.block_pixel, 1..=6).text("block_pixel"));
         });
     });
 }

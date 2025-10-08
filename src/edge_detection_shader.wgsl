@@ -46,6 +46,8 @@ struct EdgeDetectionUniform {
     uv_distortion: vec4f,
 
     edge_color: vec4f,
+
+    block_pixel: u32,
 }
 
 // -----------------------
@@ -238,6 +240,13 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
     return f32(grad > ed_uniform.color_threshold);
 }
 
+fn pixelate_uv(uv: vec2f, dims: vec2f, block_px: f32) -> vec2f {
+    let b = max(block_px, 1.0);
+    let cell = floor(uv * dims / b);
+    let center = (cell * b + 0.5 * b) / dims; // sample at block center
+    return center;
+}
+
 var<private> texture_size: vec2f;
 var<private> texel_size: vec2f;
 var<private> sample_index_i: i32 = 0;
@@ -267,26 +276,29 @@ fn fragment(
     let sample_uv = in.position.xy * min(texel_size.x, texel_size.y);
     let noise = textureSample(noise_texture, noise_sampler, sample_uv * ed_uniform.uv_distortion.xy);
 
-    let uv = in.uv + noise.xy * ed_uniform.uv_distortion.zw;
+    let uv_noise = in.uv + noise.xy * ed_uniform.uv_distortion.zw;
+    let block_pixel = max(f32(ed_uniform.block_pixel), 1.0);
+    let uv_noise_px = pixelate_uv(uv_noise, texture_size, f32(block_pixel));
+    let uv_px = pixelate_uv(in.uv, texture_size, f32(block_pixel));
 
     var edge = 0.0;
 
 #ifdef ENABLE_DEPTH
-    let edge_depth = detect_edge_depth(uv, ed_uniform.depth_thickness, fresnel);
+    let edge_depth = detect_edge_depth(uv_noise_px, ed_uniform.depth_thickness, fresnel);
     edge = max(edge, edge_depth);
 #endif
 
 #ifdef ENABLE_NORMAL
-    let edge_normal = detect_edge_normal(uv, ed_uniform.normal_thickness);
+    let edge_normal = detect_edge_normal(uv_noise_px, ed_uniform.normal_thickness);
     edge = max(edge, edge_normal);
 #endif
 
 #ifdef ENABLE_COLOR
-    let edge_color = detect_edge_color(uv, ed_uniform.color_thickness);
+    let edge_color = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
     edge = max(edge, edge_color);
 #endif
 
-    var color = textureSample(screen_texture, filtering_sampler, in.uv).rgb;
+    var color = textureSample(screen_texture, filtering_sampler, uv_px).rgb;
     color = mix(color, ed_uniform.edge_color.rgb, edge);
 
     return vec4f(color, 1.0);

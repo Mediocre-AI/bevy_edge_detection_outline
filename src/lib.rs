@@ -423,6 +423,8 @@ pub struct EdgeDetection {
     /// Whether to enable color-based edge detection.
     /// If `true`, edges will be detected based on color variations.
     pub enable_color: bool,
+    /// Pixel block size.
+    pub block_pixel: u32,
 }
 
 impl Default for EdgeDetection {
@@ -447,6 +449,8 @@ impl Default for EdgeDetection {
             enable_depth: true,
             enable_normal: true,
             enable_color: false,
+
+            block_pixel: 1,
         }
     }
 }
@@ -467,6 +471,8 @@ pub struct EdgeDetectionUniform {
     pub uv_distortion: Vec4,
 
     pub edge_color: LinearRgba,
+
+    pub block_pixel: u32,
 }
 
 impl From<&EdgeDetection> for EdgeDetectionUniform {
@@ -491,6 +497,8 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
             ),
 
             edge_color: ed.edge_color.into(),
+
+            block_pixel: ed.block_pixel,
         }
     }
 }
