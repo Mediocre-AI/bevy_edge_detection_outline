@@ -79,19 +79,11 @@ impl Plugin for EdgeDetectionPlugin {
             .add_render_graph_edges(
                 Core3d,
                 (
-                    Node3d::Tonemapping,
+                    Node3d::PostProcessing,
                     EdgeDetectionLabel,
-                    Node3d::EndMainPassPostProcessing,
+                    self.before.clone(),
                 ),
             );
-        // .add_render_graph_edges(
-        //     Core3d,
-        //     (
-        //         Node3d::PostProcessing,
-        //         EdgeDetectionLabel,
-        //         self.before.clone(),
-        //     ),
-        // );
     }
 
     fn finish(&self, app: &mut App) {
