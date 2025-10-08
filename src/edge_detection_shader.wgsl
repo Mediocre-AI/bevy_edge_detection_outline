@@ -67,14 +67,14 @@ fn depth_ndc_to_view_z(ndc_depth: f32) -> f32 {
 #else ifdef VIEW_PROJECTION_ORTHOGRAPHIC
     return -(view.clip_from_view[3][2] - ndc_depth) / view.clip_from_view[2][2];
 #else
-    let view_pos = view.view_from_clip * vec4(0.0, 0.0, ndc_depth, 1.0);
+    let view_pos = view.view_from_clip * vec4f(0.0, 0.0, ndc_depth, 1.0);
     return view_pos.z / view_pos.w;
 #endif
 }
 
 /// Convert a ndc space position to world space
 fn position_ndc_to_world(ndc_pos: vec3<f32>) -> vec3<f32> {
-    let world_pos = view.world_from_clip * vec4(ndc_pos, 1.0);
+    let world_pos = view.world_from_clip * vec4f(ndc_pos, 1.0);
     return world_pos.xyz / world_pos.w;
 }
 
@@ -152,7 +152,7 @@ fn detect_edge_depth(uv: vec2f, thickness: f32, fresnel: f32) -> f32 {
 
 fn prepass_normal_unpack(uv: vec2f) -> vec3f {
     let normal_packed = prepass_normal(uv);
-    return normalize(normal_packed.xyz * 2.0 - vec3(1.0));
+    return normalize(normal_packed.xyz * 2.0 - vec3f(1.0));
 }
 
 fn prepass_normal(uv: vec2f) -> vec3f {
@@ -211,6 +211,7 @@ fn color_gradient_x(uv: vec2f, y: f32, thickness: f32) -> vec3f {
     let r_coord = uv + texel_size * vec2f( thickness, y);    // right coordinate
 
     return prepass_color(r_coord) - prepass_color(l_coord);
+
 }
 
 fn color_gradient_y(uv: vec2f, x: f32, thickness: f32) -> vec3f {
@@ -218,6 +219,7 @@ fn color_gradient_y(uv: vec2f, x: f32, thickness: f32) -> vec3f {
     let t_coord = uv + texel_size * vec2f(x,  thickness);    // top  coordinate
 
     return prepass_color(t_coord) - prepass_color(d_coord);
+
 }
 
 fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
@@ -251,7 +253,7 @@ fn fragment(
     sample_index_i = i32(sample_index);
 #endif
 
-    texture_size = vec2f(textureDimensions(screen_texture));
+    texture_size = vec2f(textureDimensions(screen_texture, 0));
     texel_size = 1.0 / texture_size;
 
     let near_ndc_pos = vec3f(uv_to_ndc(in.uv), 1.0);
@@ -260,7 +262,7 @@ fn fragment(
     let view_direction = calculate_view(near_world_pos);
     
     let normal = prepass_normal_unpack(in.uv);
-    let fresnel = 1.0 - saturate(dot(normal, view_direction));;
+    let fresnel = 1.0 - saturate(dot(normal, view_direction));
 
     let sample_uv = in.position.xy * min(texel_size.x, texel_size.y);
     let noise = textureSample(noise_texture, noise_sampler, sample_uv * ed_uniform.uv_distortion.xy);
@@ -284,7 +286,7 @@ fn fragment(
     edge = max(edge, edge_color);
 #endif
 
-    var color = textureSample(screen_texture, texture_sampler, in.uv).rgb;
+    var color = textureSample(screen_texture, filtering_sampler, in.uv).rgb;
     color = mix(color, ed_uniform.edge_color.rgb, edge);
 
     return vec4f(color, 1.0);

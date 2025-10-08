@@ -11,7 +11,7 @@ use bevy::{
     ecs::query::QueryItem,
     prelude::*,
     render::{
-        Render, RenderApp, RenderSystems,
+        Extract, Render, RenderApp, RenderSystems,
         extract_component::{
             ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
             UniformComponentPlugin,
@@ -29,8 +29,9 @@ use bevy::{
         },
         renderer::{RenderContext, RenderDevice},
         sync_component::SyncComponentPlugin,
+        sync_world::RenderEntity,
         texture::GpuImage,
-        view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+        view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
     },
 };
 
@@ -67,6 +68,10 @@ impl Plugin for EdgeDetectionPlugin {
         render_app
             .init_resource::<SpecializedRenderPipelines<EdgeDetectionPipeline>>()
             .add_systems(
+                ExtractSchedule,
+                EdgeDetectionUniform::extract_edge_detection_settings,
+            )
+            .add_systems(
                 Render,
                 prepare_edge_detection_pipelines.in_set(RenderSystems::Prepare),
             )
@@ -74,11 +79,19 @@ impl Plugin for EdgeDetectionPlugin {
             .add_render_graph_edges(
                 Core3d,
                 (
-                    Node3d::PostProcessing,
+                    Node3d::Tonemapping,
                     EdgeDetectionLabel,
-                    self.before.clone(),
+                    Node3d::EndMainPassPostProcessing,
                 ),
             );
+        // .add_render_graph_edges(
+        //     Core3d,
+        //     (
+        //         Node3d::PostProcessing,
+        //         EdgeDetectionLabel,
+        //         self.before.clone(),
+        //     ),
+        // );
     }
 
     fn finish(&self, app: &mut App) {
@@ -274,24 +287,17 @@ pub fn prepare_edge_detection_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<EdgeDetectionPipeline>>,
     edge_detection_pipeline: Res<EdgeDetectionPipeline>,
-    view_targets: Query<(
-        Entity,
-        &ExtractedView,
-        &EdgeDetection,
-        &Msaa,
-        Option<&Projection>,
-    )>,
+    query: Query<(Entity, &EdgeDetection, Option<&Projection>, &ViewTarget)>,
 ) {
-    for (entity, view, edge_detection, msaa, projection) in view_targets.iter() {
-        let (hdr, multisampled) = (view.hdr, *msaa != Msaa::Off);
-
-        commands
-            .entity(entity)
-            .insert(EdgeDetectionPipelineId(pipelines.specialize(
-                &pipeline_cache,
-                &edge_detection_pipeline,
-                EdgeDetectionKey::new(edge_detection, hdr, multisampled, projection),
-            )));
+    for (entity, edge_detection, projection, view_target) in &query {
+        let multisampled = view_target.sampled_main_texture_view().is_some();
+        let hdr = view_target.is_hdr();
+        let id = pipelines.specialize(
+            &pipeline_cache,
+            &edge_detection_pipeline,
+            EdgeDetectionKey::new(edge_detection, hdr, multisampled, projection),
+        );
+        commands.entity(entity).insert(EdgeDetectionPipelineId(id));
     }
 }
 
@@ -441,7 +447,7 @@ impl Default for EdgeDetection {
             steep_angle_threshold: 0.00,
             steep_angle_multiplier: 0.30,
 
-            uv_distortion_frequency: Vec2::splat(1.0),
+            uv_distortion_frequency: Vec2::splat(0.0),
             uv_distortion_strength: Vec2::splat(0.004),
 
             edge_color: Color::BLACK,
@@ -453,7 +459,7 @@ impl Default for EdgeDetection {
     }
 }
 
-#[derive(Component, Clone, Copy, ShaderType)]
+#[derive(Component, Clone, Copy, ShaderType, ExtractComponent)]
 pub struct EdgeDetectionUniform {
     pub depth_threshold: f32,
     pub normal_threshold: f32,
@@ -497,16 +503,25 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
     }
 }
 
-impl ExtractComponent for EdgeDetectionUniform {
-    type QueryData = &'static EdgeDetection;
-    type QueryFilter = ();
-    type Out = EdgeDetectionUniform;
-
-    fn extract_component(edge_detection: QueryItem<Self::QueryData>) -> Option<Self::Out> {
+impl EdgeDetectionUniform {
+    pub fn extract_edge_detection_settings(
+        mut commands: Commands,
+        mut query: Extract<Query<(RenderEntity, &EdgeDetection)>>,
+    ) {
         if !DEPTH_TEXTURE_SAMPLING_SUPPORTED {
-            return None;
+            info_once!(
+                "Disable edge detection on this platform because depth textures aren't supported correctly"
+            );
+            return;
         }
-        Some(EdgeDetectionUniform::from(edge_detection))
+
+        for (entity, edge_detection) in query.iter_mut() {
+            let mut entity_commands = commands
+                .get_entity(entity)
+                .expect("Edge Detection entity wasn't synced.");
+
+            entity_commands.insert((*edge_detection, EdgeDetectionUniform::from(edge_detection)));
+        }
     }
 }
 
@@ -550,12 +565,14 @@ impl ViewNode for EdgeDetectionNode {
             .resource::<PipelineCache>()
             .get_render_pipeline(edge_detection_pipeline_id.0)
         else {
+            info!("pipeline not found");
             return Ok(());
         };
 
         let (Some(depth_texture), Some(normal_texture)) =
             (&prepass_textures.depth, &prepass_textures.normal)
         else {
+            info!("depth or normal texture not found");
             return Ok(());
         };
 
@@ -563,11 +580,13 @@ impl ViewNode for EdgeDetectionNode {
             .resource::<RenderAssets<GpuImage>>()
             .get(&edge_detection_pipeline.noise_texture)
         else {
+            info!("noise texture not found");
             return Ok(());
         };
 
         let Some(view_uniforms_binding) = world.resource::<ViewUniforms>().uniforms.binding()
         else {
+            info!("view uniforms not found");
             return Ok(());
         };
 
@@ -576,6 +595,7 @@ impl ViewNode for EdgeDetectionNode {
             .uniforms()
             .binding()
         else {
+            info!("edge detection uniform not found");
             return Ok(());
         };
 
