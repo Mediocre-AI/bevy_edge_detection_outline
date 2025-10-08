@@ -4,13 +4,21 @@
 
 A post-processing outline effect for Bevy (0.17.2+) that detects edges from depth, normals, and/or color and draws customizable outlines. This is a re-implementation of the original plugin with a Bevy 0.17.2 rendering pipeline.
 
+![Example](example.PNG)
+
+## Version compatibility
+
+| Crate version | Bevy version |
+| --- | --- |
+| 0.1.x | 0.17.2 – 0.17.x |
+
 ## Features
 
 - **Plugin-based**: Add `EdgeDetectionPlugin` to your app; no manual render graph wiring.
 - **Edge sources**: Toggle depth-, normal-, and color-based edge detection independently.
 - **Quality controls**: Per-source thresholds and thickness values.
 - **Stylization**: UV distortion controls and configurable `edge_color`.
-- **Camera prepasses**: Uses `DepthPrepass` and `NormalPrepass` for high-quality outlines.
+- **Camera prepasses**: Uses `DepthPrepass` and `NormalPrepass`.
 - **MSAA/HDR aware**: Specializes pipelines for MSAA and HDR view targets.
 - **Works with SMAA**: You can order outlines before SMAA if desired.
 
