@@ -100,13 +100,13 @@ pub struct EdgeDetectionPipeline {
     pub linear_sampler: Sampler,
     pub nonfiltering_sampler: Sampler,
     pub noise_sampler: Sampler,
-    pub layout_with_msaa: BindGroupLayout,
-    pub layout_without_msaa: BindGroupLayout,
+    pub layout_with_msaa: BindGroupLayoutDescriptor,
+    pub layout_without_msaa: BindGroupLayoutDescriptor,
     pub fullscreen_shader: FullscreenShader,
 }
 
 impl EdgeDetectionPipeline {
-    pub fn bind_group_layout(&self, multisampled: bool) -> &BindGroupLayout {
+    pub fn bind_group_layout(&self, multisampled: bool) -> &BindGroupLayoutDescriptor {
         if multisampled {
             &self.layout_with_msaa
         } else {
@@ -117,16 +117,12 @@ impl EdgeDetectionPipeline {
 
 impl FromWorld for EdgeDetectionPipeline {
     fn from_world(world: &mut World) -> Self {
-        let render_device = world.resource::<RenderDevice>();
-
-        // let noise_texture = world.load_asset("embedded://bevy_edge_detection/perlin_noise.png");
         let shader = load_embedded_asset!(world, "edge_detection_shader.wgsl");
         let noise_texture = load_embedded_asset!(world, "perlin_noise.png");
 
-        let layout_with_msaa = render_device.create_bind_group_layout(
+        let layout_with_msaa = BindGroupLayoutDescriptor::new(
             "edge_detection: bind_group_layout with msaa",
             &BindGroupLayoutEntries::sequential(
-                // The layout entries will only be visible in the fragment stage
                 ShaderStages::FRAGMENT,
                 (
                     // color attachment
@@ -151,10 +147,9 @@ impl FromWorld for EdgeDetectionPipeline {
             ),
         );
 
-        let layout_without_msaa = render_device.create_bind_group_layout(
+        let layout_without_msaa = BindGroupLayoutDescriptor::new(
             "edge_detection: bind_group_layout without msaa",
             &BindGroupLayoutEntries::sequential(
-                // The layout entries will only be visible in the fragment stage
                 ShaderStages::FRAGMENT,
                 (
                     // color attachment
@@ -178,6 +173,8 @@ impl FromWorld for EdgeDetectionPipeline {
                 ),
             ),
         );
+
+        let render_device = world.resource::<RenderDevice>();
 
         let linear_sampler = render_device.create_sampler(&SamplerDescriptor {
             label: Some("edge detection linear sampler"),
@@ -560,9 +557,9 @@ impl ViewNode for EdgeDetectionNode {
         world: &World,
     ) -> Result<(), NodeRunError> {
         let edge_detection_pipeline = world.resource::<EdgeDetectionPipeline>();
+        let pipeline_cache = world.resource::<PipelineCache>();
 
-        let Some(pipeline) = world
-            .resource::<PipelineCache>()
+        let Some(pipeline) = pipeline_cache
             .get_render_pipeline(edge_detection_pipeline_id.0)
         else {
             info!("pipeline not found");
@@ -618,7 +615,7 @@ impl ViewNode for EdgeDetectionNode {
         let multisampled = *msaa != Msaa::Off;
         let bind_group = render_context.render_device().create_bind_group(
             "edge_detection_bind_group",
-            edge_detection_pipeline.bind_group_layout(multisampled),
+            &pipeline_cache.get_bind_group_layout(edge_detection_pipeline.bind_group_layout(multisampled)),
             // It's important for this to match the BindGroupLayout defined in the PostProcessPipeline
             &BindGroupEntries::sequential((
                 // Make sure to use the source view

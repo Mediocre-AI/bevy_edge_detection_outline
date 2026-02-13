@@ -2,7 +2,7 @@
 
 ## Overview
 
-A post-processing outline effect for Bevy (0.17.2+) that detects edges from depth, normals, and/or color and draws customizable outlines. This is a re-implementation of the original plugin with a Bevy 0.17.2 rendering pipeline.
+A post-processing outline effect for Bevy that detects edges from depth, normals, and/or color and draws customizable outlines. This is a re-implementation of the original plugin updated for modern Bevy rendering pipelines.
 
 ![Example](example.PNG)
 
@@ -10,7 +10,8 @@ A post-processing outline effect for Bevy (0.17.2+) that detects edges from dept
 
 | Crate version | Bevy version |
 | --- | --- |
-| 0.1.x | 0.17.2 – 0.17.x |
+| 0.2.x | 0.18.x |
+| 0.1.x | 0.17.x |
 
 ## Features
 
@@ -96,4 +97,4 @@ Notes:
 
 ## Acknowledgments
 
-This project is a re-implementation of the [bevy_edge_detection](https://github.com/AllenPocketGamer/bevy_edge_detection) plugin for Bevy 0.17.2.
+This project is a re-implementation of the [bevy_edge_detection](https://github.com/AllenPocketGamer/bevy_edge_detection) plugin, updated for modern Bevy.

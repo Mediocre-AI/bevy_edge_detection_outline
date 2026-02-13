@@ -1,6 +1,6 @@
 [package]
 name = "bevy_edge_detection_outline"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Jungkwon Lee <deruci89@gmail.com>"]
@@ -10,8 +10,8 @@ keywords = ["bevy", "plugin", "post-processing", "edge-detection"]
 categories = ["game-engines", "graphics", "rendering"]
 
 [dependencies]
-bevy = { version = "0.17.2", features = ["webgpu"] }
+bevy = { version = "0.18", features = ["webgpu"] }
 
 [dev-dependencies]
-bevy_egui = "0.37.0"
-bevy_panorbit_camera = "0.29"
+bevy_egui = "0.39"
+bevy_panorbit_camera = "0.34"
