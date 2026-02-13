@@ -38,7 +38,7 @@ struct EdgeDetectionUniform {
     depth_thickness: f32,
     normal_thickness: f32,
     color_thickness: f32,
-    
+
     steep_angle_threshold: f32,
     steep_angle_multiplier: f32,
 
@@ -48,6 +48,7 @@ struct EdgeDetectionUniform {
     edge_color: vec4f,
 
     block_pixel: u32,
+    flat_rejection_threshold: f32,
 }
 
 // -----------------------
@@ -158,13 +159,17 @@ fn prepass_normal_unpack(uv: vec2f) -> vec3f {
 }
 
 fn prepass_normal(uv: vec2f) -> vec3f {
+    return prepass_normal_raw(uv).xyz;
+}
+
+fn prepass_normal_raw(uv: vec2f) -> vec4f {
 #ifdef MULTISAMPLED
     let pixel_coord = vec2i(uv * texture_size);
     let normal = textureLoad(normal_prepass_texture, pixel_coord, sample_index_i);
 #else
     let normal = textureSample(normal_prepass_texture, filtering_sampler, uv);
 #endif
-    return normal.xyz;
+    return normal;
 }
 
 fn normal_gradient_x(uv: vec2f, y: f32, thickness: f32) -> vec3f {
@@ -297,6 +302,47 @@ fn fragment(
     let edge_color = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
     edge = max(edge, edge_color);
 #endif
+
+    // Edge mask: suppress edges on pixels marked with alpha=0.0 in normal prepass.
+    // Materials using the NoEdgeExtension write alpha=0.0 (e.g. hex tile surfaces).
+    // Standard materials write alpha=1.0 (walls, settlements, flags, armies).
+    // Check the center pixel + immediate neighbors: if ALL have mask=0, suppress.
+    if (edge > 0.0) {
+        let center_raw = prepass_normal_raw(uv_noise_px);
+        if (center_raw.a < 0.5) {
+            // Center pixel is no-edge. Check if all neighbors are also no-edge.
+            let max_thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness);
+            var max_alpha = center_raw.a;
+            for (var iy = -1; iy <= 1; iy++) {
+                for (var ix = -1; ix <= 1; ix++) {
+                    let offset_uv = uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * max_thickness;
+                    let raw = prepass_normal_raw(offset_uv);
+                    max_alpha = max(max_alpha, raw.a);
+                }
+            }
+            // If all pixels in neighborhood are no-edge (alpha < 0.5), suppress
+            if (max_alpha < 0.5) {
+                edge = 0.0;
+            }
+        }
+    }
+
+    // Flat surface rejection (fallback for StandardMaterial entities without custom prepass)
+    if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0) {
+        let max_thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness);
+        let reject_t = ed_uniform.flat_rejection_threshold;
+        var min_ny = 1.0;
+        for (var iy = -1; iy <= 1; iy++) {
+            for (var ix = -1; ix <= 1; ix++) {
+                let offset_uv = uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * max_thickness;
+                let n = prepass_normal_unpack(offset_uv);
+                min_ny = min(min_ny, n.y);
+            }
+        }
+        if (min_ny > reject_t) {
+            edge = 0.0;
+        }
+    }
 
     var color = textureSample(screen_texture, filtering_sampler, uv_px).rgb;
     color = mix(color, ed_uniform.edge_color.rgb, edge);

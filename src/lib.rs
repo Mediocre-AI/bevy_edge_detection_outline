@@ -422,6 +422,12 @@ pub struct EdgeDetection {
     pub enable_color: bool,
     /// Pixel block size.
     pub block_pixel: u32,
+
+    /// Flat surface rejection threshold for the normal Y component.
+    /// When all normals in the 3x3 edge detection kernel have Y > this threshold,
+    /// the edge is suppressed (treated as a flat surface like hex tiles).
+    /// Set to 0.0 to disable flat rejection. Range: [0.0, 1.0]
+    pub flat_rejection_threshold: f32,
 }
 
 impl Default for EdgeDetection {
@@ -448,6 +454,8 @@ impl Default for EdgeDetection {
             enable_color: false,
 
             block_pixel: 1,
+
+            flat_rejection_threshold: 0.0,
         }
     }
 }
@@ -470,6 +478,7 @@ pub struct EdgeDetectionUniform {
     pub edge_color: LinearRgba,
 
     pub block_pixel: u32,
+    pub flat_rejection_threshold: f32,
 }
 
 impl From<&EdgeDetection> for EdgeDetectionUniform {
@@ -496,6 +505,7 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
             edge_color: ed.edge_color.into(),
 
             block_pixel: ed.block_pixel,
+            flat_rejection_threshold: ed.flat_rejection_threshold,
         }
     }
 }
