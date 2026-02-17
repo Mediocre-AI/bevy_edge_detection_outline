@@ -10,6 +10,7 @@ A post-processing outline effect for Bevy that detects edges from depth, normals
 
 | Crate version | Bevy version |
 | --- | --- |
+| 0.3.x | 0.18.x |
 | 0.2.x | 0.18.x |
 | 0.1.x | 0.17.x |
 
