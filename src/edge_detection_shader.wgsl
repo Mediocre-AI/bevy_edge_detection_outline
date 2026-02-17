@@ -344,8 +344,10 @@ fn fragment(
         }
     }
 
-    var color = textureSample(screen_texture, filtering_sampler, uv_px).rgb;
-    color = mix(color, ed_uniform.edge_color.rgb, edge);
+    let src = textureSample(screen_texture, filtering_sampler, uv_px);
+    var color = mix(src.rgb, ed_uniform.edge_color.rgb, edge);
 
-    return vec4f(color, 1.0);
+    // Preserve source alpha for compositing (render-to-texture transparency).
+    // Where an edge is drawn, force opaque so outlines at entity boundaries are visible.
+    return vec4f(color, max(src.a, edge));
 }
