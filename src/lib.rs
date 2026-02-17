@@ -239,6 +239,11 @@ impl SpecializedRenderPipeline for EdgeDetectionPipeline {
             shader_defs.push("ENABLE_COLOR".into());
         }
 
+        match key.operator {
+            EdgeOperator::Sobel => shader_defs.push("OPERATOR_SOBEL".into()),
+            EdgeOperator::RobertsCross => shader_defs.push("OPERATOR_ROBERTS_CROSS".into()),
+        }
+
         if key.multisampled {
             shader_defs.push("MULTISAMPLED".into());
         }
@@ -294,6 +299,16 @@ pub fn prepare_edge_detection_pipelines(
 //  Core structs and types
 // ──────────────────────────────────────────────
 
+/// Edge detection operator type.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Reflect)]
+pub enum EdgeOperator {
+    /// 3x3 Sobel filter — 8 samples per type, wider edges, stronger gradients.
+    Sobel,
+    /// 2x2 Roberts Cross — 4 samples per type, clean 1px edges.
+    #[default]
+    RobertsCross,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProjectionType {
     None,
@@ -326,6 +341,8 @@ pub struct EdgeDetectionKey {
     /// Whether to enable color-based edge detection.
     /// If `true`, edges will be detected based on color variations.
     pub enable_color: bool,
+    /// Edge detection operator.
+    pub operator: EdgeOperator,
 
     /// Whether we're using HDR.
     pub hdr: bool,
@@ -346,6 +363,7 @@ impl EdgeDetectionKey {
             enable_depth: edge_detection.enable_depth,
             enable_normal: edge_detection.enable_normal,
             enable_color: edge_detection.enable_color,
+            operator: edge_detection.operator,
 
             hdr,
             multisampled,
@@ -428,20 +446,23 @@ pub struct EdgeDetection {
     /// the edge is suppressed (treated as a flat surface like hex tiles).
     /// Set to 0.0 to disable flat rejection. Range: [0.0, 1.0]
     pub flat_rejection_threshold: f32,
+
+    /// Edge detection operator: Sobel (3x3, wider) or RobertsCross (2x2, 1px).
+    pub operator: EdgeOperator,
 }
 
 impl Default for EdgeDetection {
     fn default() -> Self {
         Self {
-            depth_threshold: 1.0,
-            normal_threshold: 0.8,
+            depth_threshold: 0.9,
+            normal_threshold: 0.45,
             color_threshold: 0.1,
 
             depth_thickness: 1.0,
             normal_thickness: 1.0,
             color_thickness: 1.0,
 
-            steep_angle_threshold: 0.00,
+            steep_angle_threshold: 0.75,
             steep_angle_multiplier: 0.30,
 
             uv_distortion_frequency: Vec2::splat(0.0),
@@ -456,6 +477,8 @@ impl Default for EdgeDetection {
             block_pixel: 1,
 
             flat_rejection_threshold: 0.0,
+
+            operator: EdgeOperator::default(),
         }
     }
 }

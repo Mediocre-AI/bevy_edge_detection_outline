@@ -1,7 +1,9 @@
-//! Edge Detection using 3x3 Sobel Filter
+//! Edge Detection Shader
 //!
-//! This shader implements edge detection based on depth, normal, and color gradients using a 3x3 Sobel filter.
-//! It combines the results of depth, normal, and color edge detection to produce a final edge map.
+//! This shader implements edge detection based on depth, normal, and color gradients.
+//! Two operators are supported via shader defs:
+//!   - OPERATOR_SOBEL:        3x3 Sobel filter — 8 samples per type, wider edges, stronger gradients.
+//!   - OPERATOR_ROBERTS_CROSS: 2x2 Roberts Cross — 4 samples per type, clean 1px edges.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 #import bevy_render::view::View
@@ -110,40 +112,38 @@ fn prepass_view_z(uv: vec2f) -> f32 {
     return depth_ndc_to_view_z(depth);
 }
 
-fn view_z_gradient_x(uv: vec2f, y: f32, thickness: f32) -> f32 {
-    let l_coord = uv + texel_size * vec2f(-thickness, y);    // left  coordinate
-    let r_coord = uv + texel_size * vec2f( thickness, y);    // right coordinate
-
-    return prepass_view_z(r_coord) - prepass_view_z(l_coord); 
-}
-
-fn view_z_gradient_y(uv: vec2f, x: f32, thickness: f32) -> f32 {
-    let d_coord = uv + texel_size * vec2f(x, -thickness);    // down coordinate
-    let t_coord = uv + texel_size * vec2f(x,  thickness);    // top  coordinate
-
-    return prepass_view_z(t_coord) - prepass_view_z(d_coord);
-}
-
 fn detect_edge_depth(uv: vec2f, thickness: f32, fresnel: f32) -> f32 {
-    let deri_x = 
-        view_z_gradient_x(uv, thickness, thickness) +
-        2.0 * view_z_gradient_x(uv, 0.0, thickness) +
-        view_z_gradient_x(uv, -thickness, thickness);
+    let offset = texel_size * thickness;
 
-    let deri_y =
-        view_z_gradient_y(uv, thickness, thickness) +
-        2.0 * view_z_gradient_y(uv, 0.0, thickness) +
-        view_z_gradient_y(uv, -thickness, thickness);
+#ifdef OPERATOR_SOBEL
+    // 3x3 Sobel: horizontal/vertical gradient from 8 neighbors
+    let d_tl = prepass_view_z(uv + vec2f(-offset.x,  offset.y));
+    let d_t  = prepass_view_z(uv + vec2f(      0.0,  offset.y));
+    let d_tr = prepass_view_z(uv + vec2f( offset.x,  offset.y));
+    let d_l  = prepass_view_z(uv + vec2f(-offset.x,       0.0));
+    let d_r  = prepass_view_z(uv + vec2f( offset.x,       0.0));
+    let d_bl = prepass_view_z(uv + vec2f(-offset.x, -offset.y));
+    let d_b  = prepass_view_z(uv + vec2f(      0.0, -offset.y));
+    let d_br = prepass_view_z(uv + vec2f( offset.x, -offset.y));
 
-    // why not `let grad = sqrt(deri_x * deri_x + deri_y * deri_y);`?
-    //
-    // Because ·deri_x· or ·deri_y· might be too large,
-    // causing overflow in the calculation and resulting in incorrect results.
-    let grad = max(abs(deri_x), abs(deri_y));
-
+    let gx = -d_tl - 2.0*d_l - d_bl + d_tr + 2.0*d_r + d_br;
+    let gy = -d_tl - 2.0*d_t - d_tr + d_bl + 2.0*d_b + d_br;
+    let grad = max(abs(gx), abs(gy));
     let view_z = abs(prepass_view_z(uv));
+#else
+    // 2x2 Roberts Cross: diagonal differences from 4 samples
+    let d00 = prepass_view_z(uv);
+    let d10 = prepass_view_z(uv + vec2f(offset.x, 0.0));
+    let d01 = prepass_view_z(uv + vec2f(0.0, offset.y));
+    let d11 = prepass_view_z(uv + offset);
 
-    let steep_angle_adjustment = 
+    let diff_diag0 = d00 - d11;
+    let diff_diag1 = d10 - d01;
+    let grad = max(abs(diff_diag0), abs(diff_diag1));
+    let view_z = abs(d00);
+#endif
+
+    let steep_angle_adjustment =
         smoothstep(ed_uniform.steep_angle_threshold, 1.0, fresnel) * ed_uniform.steep_angle_multiplier * view_z;
 
     return f32(grad > ed_uniform.depth_threshold * (1.0 + steep_angle_adjustment));
@@ -172,35 +172,32 @@ fn prepass_normal_raw(uv: vec2f) -> vec4f {
     return normal;
 }
 
-fn normal_gradient_x(uv: vec2f, y: f32, thickness: f32) -> vec3f {
-    let l_coord = uv + texel_size * vec2f(-thickness, y);    // left  coordinate
-    let r_coord = uv + texel_size * vec2f( thickness, y);    // right coordinate
-
-    return prepass_normal(r_coord) - prepass_normal(l_coord);
-}
-
-fn normal_gradient_y(uv: vec2f, x: f32, thickness: f32) -> vec3f {
-    let d_coord = uv + texel_size * vec2f(x, -thickness);    // down coordinate
-    let t_coord = uv + texel_size * vec2f(x,  thickness);    // top  coordinate
-
-    return prepass_normal(t_coord) - prepass_normal(d_coord);
-}
-
 fn detect_edge_normal(uv: vec2f, thickness: f32) -> f32 {
-    let deri_x = abs(
-        normal_gradient_x(uv,  thickness, thickness) +
-        2.0 * normal_gradient_x(uv,  0.0, thickness) +
-        normal_gradient_x(uv, -thickness, thickness));
+    let offset = texel_size * thickness;
 
-    let deri_y = abs(
-        normal_gradient_y(uv, thickness, thickness) +
-        2.0 * normal_gradient_y(uv, 0.0, thickness) +
-        normal_gradient_y(uv, -thickness, thickness));
+#ifdef OPERATOR_SOBEL
+    let n_tl = prepass_normal(uv + vec2f(-offset.x,  offset.y));
+    let n_t  = prepass_normal(uv + vec2f(      0.0,  offset.y));
+    let n_tr = prepass_normal(uv + vec2f( offset.x,  offset.y));
+    let n_l  = prepass_normal(uv + vec2f(-offset.x,       0.0));
+    let n_r  = prepass_normal(uv + vec2f( offset.x,       0.0));
+    let n_bl = prepass_normal(uv + vec2f(-offset.x, -offset.y));
+    let n_b  = prepass_normal(uv + vec2f(      0.0, -offset.y));
+    let n_br = prepass_normal(uv + vec2f( offset.x, -offset.y));
 
-    let x_max = max(deri_x.x, max(deri_x.y, deri_x.z));
-    let y_max = max(deri_y.x, max(deri_y.y, deri_y.z));
-    
-    let grad = max(x_max, y_max);
+    let gx = -n_tl - 2.0*n_l - n_bl + n_tr + 2.0*n_r + n_br;
+    let gy = -n_tl - 2.0*n_t - n_tr + n_bl + 2.0*n_b + n_br;
+    let grad = sqrt(dot(gx, gx) + dot(gy, gy));
+#else
+    let n00 = prepass_normal(uv);
+    let n10 = prepass_normal(uv + vec2f(offset.x, 0.0));
+    let n01 = prepass_normal(uv + vec2f(0.0, offset.y));
+    let n11 = prepass_normal(uv + offset);
+
+    let diff0 = n00 - n11;
+    let diff1 = n10 - n01;
+    let grad = sqrt(dot(diff0, diff0) + dot(diff1, diff1));
+#endif
 
     return f32(grad > ed_uniform.normal_threshold);
 }
@@ -213,34 +210,32 @@ fn prepass_color(uv: vec2f) -> vec3f {
     return textureSample(screen_texture, filtering_sampler, uv).rgb;
 }
 
-fn color_gradient_x(uv: vec2f, y: f32, thickness: f32) -> vec3f {
-    let l_coord = uv + texel_size * vec2f(-thickness, y);    // left  coordinate
-    let r_coord = uv + texel_size * vec2f( thickness, y);    // right coordinate
-
-    return prepass_color(r_coord) - prepass_color(l_coord);
-
-}
-
-fn color_gradient_y(uv: vec2f, x: f32, thickness: f32) -> vec3f {
-    let d_coord = uv + texel_size * vec2f(x, -thickness);    // down coordinate
-    let t_coord = uv + texel_size * vec2f(x,  thickness);    // top  coordinate
-
-    return prepass_color(t_coord) - prepass_color(d_coord);
-
-}
-
 fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
-    let deri_x = 
-        color_gradient_x(uv,  thickness, thickness) +
-        2.0 * color_gradient_x(uv,  0.0, thickness) +
-        color_gradient_x(uv, -thickness, thickness);
+    let offset = texel_size * thickness;
 
-    let deri_y =
-        color_gradient_y(uv,  thickness, thickness) +
-        2.0 * color_gradient_y(uv,  0.0, thickness) +
-        color_gradient_y(uv, -thickness, thickness);
+#ifdef OPERATOR_SOBEL
+    let c_tl = prepass_color(uv + vec2f(-offset.x,  offset.y));
+    let c_t  = prepass_color(uv + vec2f(      0.0,  offset.y));
+    let c_tr = prepass_color(uv + vec2f( offset.x,  offset.y));
+    let c_l  = prepass_color(uv + vec2f(-offset.x,       0.0));
+    let c_r  = prepass_color(uv + vec2f( offset.x,       0.0));
+    let c_bl = prepass_color(uv + vec2f(-offset.x, -offset.y));
+    let c_b  = prepass_color(uv + vec2f(      0.0, -offset.y));
+    let c_br = prepass_color(uv + vec2f( offset.x, -offset.y));
 
-    let grad = max(length(deri_x), length(deri_y));
+    let gx = -c_tl - 2.0*c_l - c_bl + c_tr + 2.0*c_r + c_br;
+    let gy = -c_tl - 2.0*c_t - c_tr + c_bl + 2.0*c_b + c_br;
+    let grad = sqrt(dot(gx, gx) + dot(gy, gy));
+#else
+    let c00 = prepass_color(uv);
+    let c10 = prepass_color(uv + vec2f(offset.x, 0.0));
+    let c01 = prepass_color(uv + vec2f(0.0, offset.y));
+    let c11 = prepass_color(uv + offset);
+
+    let diff0 = c00 - c11;
+    let diff1 = c10 - c01;
+    let grad = sqrt(dot(diff0, diff0) + dot(diff1, diff1));
+#endif
 
     return f32(grad > ed_uniform.color_threshold);
 }

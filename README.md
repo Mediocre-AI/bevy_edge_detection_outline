@@ -98,3 +98,5 @@ Notes:
 ## Acknowledgments
 
 This project is a re-implementation of the [bevy_edge_detection](https://github.com/AllenPocketGamer/bevy_edge_detection) plugin, updated for modern Bevy.
+
+Edge detection techniques reference: [Edge Detection Outlines](https://ameye.dev/notes/edge-detection-outlines/) by Alexander Ameye.
