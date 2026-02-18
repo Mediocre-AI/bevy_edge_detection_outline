@@ -1,6 +1,7 @@
 [package]
 name = "bevy_edge_detection_outline"
-version = "0.3.1"
+version = "0.3.2"
+exclude = ["demo.gif"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Jungkwon Lee <deruci89@gmail.com>"]
