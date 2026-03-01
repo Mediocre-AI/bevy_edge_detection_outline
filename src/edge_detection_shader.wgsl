@@ -1,9 +1,11 @@
 //! Edge Detection Shader
 //!
 //! This shader implements edge detection based on depth, normal, and color gradients.
-//! Two operators are supported via shader defs:
+//! Three operators are supported via shader defs:
 //!   - OPERATOR_SOBEL:        3x3 Sobel filter — 8 samples per type, wider edges, stronger gradients.
 //!   - OPERATOR_ROBERTS_CROSS: 2x2 Roberts Cross — 4 samples per type, clean 1px edges.
+//!   - OPERATOR_PIXEL_ART:    UDLR 4-direction pairwise comparison — 1px guaranteed, silhouette/crease
+//!                            priority, per-entity channel mask (alpha encoding).
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 #import bevy_render::view::View
@@ -48,6 +50,9 @@ struct EdgeDetectionUniform {
     uv_distortion: vec4f,
 
     edge_color: vec4f,
+
+    silhouette_color: vec4f,
+    crease_color: vec4f,
 
     block_pixel: u32,
     flat_rejection_threshold: f32,
@@ -240,6 +245,49 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
     return f32(grad > ed_uniform.color_threshold);
 }
 
+// -----------------------
+// Channel Mask Decoding --
+// -----------------------
+
+/// Decode the normal prepass alpha into (enable_silhouette, enable_crease).
+/// Alpha encoding: 0.0=SKIP, 0.25=SILHOUETTE_ONLY, 0.50=CREASE_ONLY, 0.75~1.0=BOTH
+fn decode_edge_mask(alpha: f32) -> vec2<bool> {
+    if (alpha < 0.125) { return vec2<bool>(false, false); }
+    else if (alpha < 0.375) { return vec2<bool>(true, false); }
+    else if (alpha < 0.625) { return vec2<bool>(false, true); }
+    else { return vec2<bool>(true, true); }
+}
+
+// -----------------------
+// PixelArt Operator ------
+// -----------------------
+
+#ifdef OPERATOR_PIXEL_ART
+
+/// UDLR pairwise normal comparison for crease detection.
+/// Directional tie-breaking: only marks one side to ensure 1px crease edges.
+/// If the neighbor is SKIP (alpha < 0.125), center always wins — otherwise
+/// the edge would be lost because the SKIP side never draws edges.
+fn check_crease(uv: vec2f, offset: vec2f) -> bool {
+    let n_center = prepass_normal(uv);
+    let raw_neighbor = prepass_normal_raw(uv + offset);
+    let n_neighbor = raw_neighbor.xyz;
+    let diff = n_center - n_neighbor;
+    if (dot(diff, diff) <= ed_uniform.normal_threshold * ed_uniform.normal_threshold) {
+        return false;
+    }
+    // If neighbor is SKIP, center always wins (SKIP side won't draw any edge).
+    if (raw_neighbor.a < 0.125) {
+        return true;
+    }
+    // Tie-break: only mark on the pixel with larger component sum.
+    let sum_c = n_center.x + n_center.y + n_center.z;
+    let sum_n = n_neighbor.x + n_neighbor.y + n_neighbor.z;
+    return sum_c >= sum_n;
+}
+
+#endif
+
 fn pixelate_uv(uv: vec2f, dims: vec2f, block_px: f32) -> vec2f {
     let b = max(block_px, 1.0);
     let cell = floor(uv * dims / b);
@@ -282,26 +330,132 @@ fn fragment(
     let uv_px = pixelate_uv(in.uv, texture_size, f32(block_pixel));
 
     var edge = 0.0;
+    var resolved_edge_color = ed_uniform.edge_color;
 
+#ifdef OPERATOR_PIXEL_ART
+    // PixelArt operator: UDLR pairwise comparison with silhouette/crease priority.
+    let px_offset = vec2f(block_pixel, block_pixel) / texture_size;
+
+    let offsets = array<vec2f, 4>(
+        vec2f(0.0, px_offset.y),   // Down (+y in UV space)
+        vec2f(0.0, -px_offset.y),  // Up
+        vec2f(-px_offset.x, 0.0),  // Left
+        vec2f(px_offset.x, 0.0),   // Right
+    );
+
+    // Decode per-entity edge mask from normal prepass alpha
+    let mask = decode_edge_mask(prepass_normal_raw(uv_noise_px).a);
+
+    var is_silhouette = false;
+    var is_crease = false;
+    var at_depth_boundary = false;
+
+    // 1) Silhouette search — directional: only foreground pixel gets the edge.
+    //    Also tracks if we're at ANY depth boundary (either side) to suppress crease.
+#ifdef ENABLE_DEPTH
+    if (mask.x) {
+        let center_z = prepass_view_z(uv_noise_px);
+        let view_z = abs(center_z);
+        let steep_adj = smoothstep(ed_uniform.steep_angle_threshold, 1.0, fresnel)
+                        * ed_uniform.steep_angle_multiplier * view_z;
+        let threshold = ed_uniform.depth_threshold * (1.0 + steep_adj);
+
+        for (var i = 0; i < 4; i++) {
+            let neighbor_z = prepass_view_z(uv_noise_px + offsets[i]);
+            let diff = center_z - neighbor_z;
+            if (diff > threshold) {
+                // Center is closer → foreground silhouette
+                is_silhouette = true;
+                at_depth_boundary = true;
+                break;
+            }
+            if (-diff > threshold) {
+                // Center is farther → background side of a boundary.
+                // Only suppress crease if the foreground neighbor is non-SKIP,
+                // because a SKIP neighbor won't draw its own silhouette edge.
+                let neighbor_alpha = prepass_normal_raw(uv_noise_px + offsets[i]).a;
+                if (neighbor_alpha >= 0.125) {
+                    at_depth_boundary = true;
+                }
+            }
+        }
+    }
+#endif
+
+    // 2) Crease search — skip if silhouette found OR at a depth boundary.
+    //    Suppressing crease at depth boundaries prevents the background pixel
+    //    from drawing a false crease (different objects = different normals).
+#ifdef ENABLE_NORMAL
+    if (!is_silhouette && !at_depth_boundary && mask.y) {
+        for (var j = 0; j < 4; j++) {
+            if (check_crease(uv_noise_px, offsets[j])) {
+                is_crease = true;
+                break;
+            }
+        }
+    }
+#endif
+
+    // 3) Type-specific color
+    if (is_silhouette) {
+        edge = 1.0;
+        resolved_edge_color = ed_uniform.silhouette_color;
+    } else if (is_crease) {
+        edge = 1.0;
+        resolved_edge_color = ed_uniform.crease_color;
+    }
+
+#ifdef ENABLE_COLOR
+    if (edge < 1.0) {
+        let edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
+        if (edge_color_val > 0.0) {
+            edge = 1.0;
+            resolved_edge_color = ed_uniform.edge_color;
+        }
+    }
+#endif
+
+#else
+    // Sobel / Roberts Cross operators with silhouette/crease priority.
 #ifdef ENABLE_DEPTH
     let edge_depth = detect_edge_depth(uv_noise_px, ed_uniform.depth_thickness, fresnel);
-    edge = max(edge, edge_depth);
+    if (edge_depth > 0.0) {
+        edge = 1.0;
+        resolved_edge_color = ed_uniform.silhouette_color;
+    }
 #endif
 
 #ifdef ENABLE_NORMAL
-    let edge_normal = detect_edge_normal(uv_noise_px, ed_uniform.normal_thickness);
-    edge = max(edge, edge_normal);
+    if (edge < 1.0) {
+        let edge_normal = detect_edge_normal(uv_noise_px, ed_uniform.normal_thickness);
+        if (edge_normal > 0.0) {
+            edge = 1.0;
+            resolved_edge_color = ed_uniform.crease_color;
+        }
+    }
 #endif
 
 #ifdef ENABLE_COLOR
-    let edge_color = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
-    edge = max(edge, edge_color);
+    if (edge < 1.0) {
+        let edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
+        if (edge_color_val > 0.0) {
+            edge = 1.0;
+            resolved_edge_color = ed_uniform.edge_color;
+        }
+    }
 #endif
+#endif  // OPERATOR_PIXEL_ART
 
     // Edge mask: suppress edges on pixels marked with alpha=0.0 in normal prepass.
     // Materials using the NoEdgeExtension write alpha=0.0 (e.g. hex tile surfaces).
     // Standard materials write alpha=1.0 (walls, settlements, flags, armies).
     // Check the center pixel + immediate neighbors: if ALL have mask=0, suppress.
+    //
+    // NOTE: PixelArt operator handles masking via decode_edge_mask() which supports
+    // the 4-level alpha encoding (SKIP/SILHOUETTE_ONLY/CREASE_ONLY/BOTH).
+    // This legacy suppression uses alpha < 0.5 as "no-edge", which would incorrectly
+    // suppress SILHOUETTE_ONLY (alpha=0.25). Skip it for PixelArt.
+#ifndef OPERATOR_PIXEL_ART
     if (edge > 0.0) {
         let center_raw = prepass_normal_raw(uv_noise_px);
         if (center_raw.a < 0.5) {
@@ -321,6 +475,7 @@ fn fragment(
             }
         }
     }
+#endif
 
     // Flat surface rejection (fallback for StandardMaterial entities without custom prepass)
     if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0) {
@@ -340,7 +495,8 @@ fn fragment(
     }
 
     let src = textureSample(screen_texture, filtering_sampler, uv_px);
-    var color = mix(src.rgb, ed_uniform.edge_color.rgb, edge);
+    // Blend with resolved edge color, respecting its alpha for opacity control.
+    var color = mix(src.rgb, resolved_edge_color.rgb, edge * resolved_edge_color.a);
 
     // Preserve source alpha for compositing (render-to-texture transparency).
     // Where an edge is drawn, force opaque so outlines at entity boundaries are visible.

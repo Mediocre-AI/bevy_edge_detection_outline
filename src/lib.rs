@@ -35,6 +35,20 @@ use bevy::{
     },
 };
 
+/// Alpha-channel encoding for per-entity edge mask control.
+/// Set the normal prepass alpha to one of these values to control
+/// which edge detection algorithms apply to that entity.
+pub mod edge_mask {
+    /// Skip all edge detection for this entity (roads, water surfaces).
+    pub const SKIP: f32 = 0.0;
+    /// Silhouette (depth) edges only — suppresses crease (normal) edges.
+    pub const SILHOUETTE_ONLY: f32 = 0.25;
+    /// Crease (normal) edges only — suppresses silhouette (depth) edges.
+    pub const CREASE_ONLY: f32 = 0.50;
+    /// Both silhouette and crease edges (default for StandardMaterial).
+    pub const BOTH: f32 = 1.0;
+}
+
 // ──────────────────────────────────────────────
 //  Plugin Setup
 // ──────────────────────────────────────────────
@@ -242,6 +256,7 @@ impl SpecializedRenderPipeline for EdgeDetectionPipeline {
         match key.operator {
             EdgeOperator::Sobel => shader_defs.push("OPERATOR_SOBEL".into()),
             EdgeOperator::RobertsCross => shader_defs.push("OPERATOR_ROBERTS_CROSS".into()),
+            EdgeOperator::PixelArt => shader_defs.push("OPERATOR_PIXEL_ART".into()),
         }
 
         if key.multisampled {
@@ -307,6 +322,9 @@ pub enum EdgeOperator {
     /// 2x2 Roberts Cross — 4 samples per type, clean 1px edges.
     #[default]
     RobertsCross,
+    /// UDLR 4-direction pairwise comparison with silhouette/crease priority.
+    /// Guarantees exactly 1px edges. Based on Red Giraffe technique.
+    PixelArt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -429,6 +447,11 @@ pub struct EdgeDetection {
     /// Typically a high-contrast color (e.g., red or black) to visually highlight the edges.
     pub edge_color: Color,
 
+    /// Separate color for silhouette (depth) edges. `None` inherits `edge_color`.
+    pub silhouette_color: Option<Color>,
+    /// Separate color for crease (normal) edges. `None` inherits `edge_color`.
+    pub crease_color: Option<Color>,
+
     /// Whether to enable depth-based edge detection.
     /// If `true`, edges will be detected based on depth variations.
     pub enable_depth: bool,
@@ -469,6 +492,8 @@ impl Default for EdgeDetection {
             uv_distortion_strength: Vec2::splat(0.004),
 
             edge_color: Color::BLACK,
+            silhouette_color: None,
+            crease_color: None,
 
             enable_depth: true,
             enable_normal: true,
@@ -500,12 +525,16 @@ pub struct EdgeDetectionUniform {
 
     pub edge_color: LinearRgba,
 
+    pub silhouette_color: LinearRgba,
+    pub crease_color: LinearRgba,
+
     pub block_pixel: u32,
     pub flat_rejection_threshold: f32,
 }
 
 impl From<&EdgeDetection> for EdgeDetectionUniform {
     fn from(ed: &EdgeDetection) -> Self {
+        let edge_linear: LinearRgba = ed.edge_color.into();
         Self {
             depth_threshold: ed.depth_threshold,
             normal_threshold: ed.normal_threshold,
@@ -525,7 +554,12 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
                 ed.uv_distortion_strength.y,
             ),
 
-            edge_color: ed.edge_color.into(),
+            edge_color: edge_linear,
+            silhouette_color: ed
+                .silhouette_color
+                .map(|c| c.into())
+                .unwrap_or(edge_linear),
+            crease_color: ed.crease_color.map(|c| c.into()).unwrap_or(edge_linear),
 
             block_pixel: ed.block_pixel,
             flat_rejection_threshold: ed.flat_rejection_threshold,

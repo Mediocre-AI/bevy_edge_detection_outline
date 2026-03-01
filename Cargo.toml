@@ -1,11 +1,11 @@
 [package]
 name = "bevy_edge_detection_outline"
-version = "0.3.2"
+version = "0.3.3"
 exclude = ["demo.gif"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Jungkwon Lee <deruci89@gmail.com>"]
-description = "Edge detection outline post-processing plugin for Bevy — Sobel and Roberts Cross operators, depth/normal/color edge sources (WGSL shader)."
+description = "Edge detection outline post-processing plugin for Bevy — Sobel, Roberts Cross, and PixelArt operators with silhouette/crease priority, per-entity channel mask, depth/normal/color edge sources (WGSL shader)."
 readme = "README.md"
 homepage = "https://github.com/Mediocre-AI/bevy_edge_detection_outline"
 keywords = ["bevy", "plugin", "post-processing", "edge-detection"]

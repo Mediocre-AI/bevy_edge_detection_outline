@@ -12,7 +12,7 @@ use bevy::{
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
-use bevy_edge_detection_outline::{EdgeDetection, EdgeDetectionPlugin};
+use bevy_edge_detection_outline::{EdgeDetection, EdgeDetectionPlugin, EdgeOperator};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
@@ -279,12 +279,59 @@ fn edge_detection_ui(mut ctx: EguiContexts, mut edge_detection: Single<&mut Edge
                 ui.label("uv_distortion_strength");
             });
 
+            // Operator selection
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("operator:");
+                if ui.selectable_label(edge_detection.operator == EdgeOperator::Sobel, "Sobel").clicked() {
+                    edge_detection.operator = EdgeOperator::Sobel;
+                }
+                if ui.selectable_label(edge_detection.operator == EdgeOperator::RobertsCross, "RobertsCross").clicked() {
+                    edge_detection.operator = EdgeOperator::RobertsCross;
+                }
+                if ui.selectable_label(edge_detection.operator == EdgeOperator::PixelArt, "PixelArt").clicked() {
+                    edge_detection.operator = EdgeOperator::PixelArt;
+                }
+            });
+
+            ui.separator();
             let mut color = edge_detection.edge_color.to_srgba().to_f32_array_no_alpha();
             ui.horizontal(|ui| {
                 egui::color_picker::color_edit_button_rgb(ui, &mut color);
                 ui.label("edge_color");
             });
             edge_detection.edge_color = Color::srgb_from_array(color);
+
+            // Silhouette color (depth edges)
+            let mut use_sil = edge_detection.silhouette_color.is_some();
+            let fallback = edge_detection.edge_color;
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut use_sil, "");
+                if use_sil {
+                    let sil = edge_detection.silhouette_color.get_or_insert(fallback);
+                    let mut sc = sil.to_srgba().to_f32_array_no_alpha();
+                    egui::color_picker::color_edit_button_rgb(ui, &mut sc);
+                    *sil = Color::srgb_from_array(sc);
+                } else {
+                    edge_detection.silhouette_color = None;
+                }
+                ui.label("silhouette_color");
+            });
+
+            // Crease color (normal edges)
+            let mut use_cre = edge_detection.crease_color.is_some();
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut use_cre, "");
+                if use_cre {
+                    let cre = edge_detection.crease_color.get_or_insert(fallback);
+                    let mut cc = cre.to_srgba().to_f32_array_no_alpha();
+                    egui::color_picker::color_edit_button_rgb(ui, &mut cc);
+                    *cre = Color::srgb_from_array(cc);
+                } else {
+                    edge_detection.crease_color = None;
+                }
+                ui.label("crease_color");
+            });
 
             ui.add(egui::Slider::new(&mut edge_detection.block_pixel, 1..=6).text("block_pixel"));
         });
