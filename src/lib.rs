@@ -1,25 +1,17 @@
 use bevy::{
+    anti_alias::{fxaa::fxaa, smaa::smaa},
     asset::{embedded_asset, load_embedded_asset},
     core_pipeline::{
-        FullscreenShader,
-        core_3d::{
-            DEPTH_TEXTURE_SAMPLING_SUPPORTED,
-            graph::{Core3d, Node3d},
-        },
+        Core3d, Core3dSystems, FullscreenShader,
+        core_3d::DEPTH_PREPASS_TEXTURE_SUPPORTED,
         prepass::{DepthPrepass, NormalPrepass, ViewPrepassTextures},
+        tonemapping::tonemapping,
     },
-    ecs::query::QueryItem,
     prelude::*,
     render::{
         Extract, Render, RenderApp, RenderSystems,
-        extract_component::{
-            ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
-            UniformComponentPlugin,
-        },
+        extract_component::{ComponentUniforms, DynamicUniformIndex, UniformComponentPlugin},
         render_asset::RenderAssets,
-        render_graph::{
-            NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
-        },
         render_resource::{
             binding_types::{
                 sampler, texture_2d, texture_2d_multisampled, texture_depth_2d,
@@ -27,11 +19,11 @@ use bevy::{
             },
             *,
         },
-        renderer::{RenderContext, RenderDevice},
-        sync_component::SyncComponentPlugin,
+        renderer::{RenderContext, RenderDevice, ViewQuery},
+        sync_component::{SyncComponent, SyncComponentPlugin},
         sync_world::RenderEntity,
         texture::GpuImage,
-        view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+        view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
     },
 };
 
@@ -52,17 +44,8 @@ pub mod edge_mask {
 // ──────────────────────────────────────────────
 //  Plugin Setup
 // ──────────────────────────────────────────────
-pub struct EdgeDetectionPlugin {
-    pub before: Node3d,
-}
-
-impl Default for EdgeDetectionPlugin {
-    fn default() -> Self {
-        Self {
-            before: Node3d::Fxaa,
-        }
-    }
-}
+#[derive(Default)]
+pub struct EdgeDetectionPlugin;
 
 impl Plugin for EdgeDetectionPlugin {
     fn build(&self, app: &mut App) {
@@ -70,11 +53,10 @@ impl Plugin for EdgeDetectionPlugin {
         embedded_asset!(app, "perlin_noise.png");
 
         app.register_type::<EdgeDetection>();
-        app.add_plugins(SyncComponentPlugin::<EdgeDetection>::default())
-            .add_plugins((
-                ExtractComponentPlugin::<EdgeDetectionUniform>::default(),
-                UniformComponentPlugin::<EdgeDetectionUniform>::default(),
-            ));
+        app.add_plugins((
+            SyncComponentPlugin::<EdgeDetection>::default(),
+            UniformComponentPlugin::<EdgeDetectionUniform>::default(),
+        ));
         // We need to get the render app from the main app
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -89,14 +71,17 @@ impl Plugin for EdgeDetectionPlugin {
                 Render,
                 prepare_edge_detection_pipelines.in_set(RenderSystems::Prepare),
             )
-            .add_render_graph_node::<ViewNodeRunner<EdgeDetectionNode>>(Core3d, EdgeDetectionLabel)
-            .add_render_graph_edges(
+            // Render passes are plain systems in 0.19. Run after tonemapping (so we
+            // operate on tonemapped color) and before the anti-aliasing passes (so
+            // FXAA/SMAA smooth the detected edges), within the post-process stage.
+            .add_systems(
                 Core3d,
-                (
-                    Node3d::PostProcessing,
-                    EdgeDetectionLabel,
-                    self.before.clone(),
-                ),
+                edge_detection
+                    .after(tonemapping)
+                    .before(fxaa)
+                    .before(smaa)
+                    .in_set(Core3dSystems::PostProcess)
+                    .in_set(EdgeDetectionPassSet),
             );
     }
 
@@ -104,6 +89,29 @@ impl Plugin for EdgeDetectionPlugin {
         app.sub_app_mut(RenderApp)
             .init_resource::<EdgeDetectionPipeline>();
     }
+}
+
+/// Public [`SystemSet`] containing the edge-detection render pass in the
+/// [`Core3d`] schedule. Another post-process pass that writes the same
+/// `ViewTarget` on the same camera (e.g. a compositor) has no inherent order
+/// against this pass — the scheduler picks arbitrarily. Integrators must
+/// `configure_sets` an explicit before/after relation against this set.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EdgeDetectionPassSet;
+
+// The render entity keeps a synced `EdgeDetection`, its derived
+// `EdgeDetectionUniform`, and the per-view derived `EdgeDetectionPipelineId` /
+// `DynamicUniformIndex`. ALL must be dropped when `EdgeDetection` is removed
+// from the camera in the main world: the render pass's `ViewQuery` matches on
+// the pipeline-id + uniform-index pair, so leaving those behind keeps the
+// pass running with stale state after the effect is disabled.
+impl SyncComponent for EdgeDetection {
+    type Target = (
+        EdgeDetection,
+        EdgeDetectionUniform,
+        EdgeDetectionPipelineId,
+        DynamicUniformIndex<EdgeDetectionUniform>,
+    );
 }
 
 // This contains global data used by the render pipeline. This will be created once on startup.
@@ -230,11 +238,7 @@ impl SpecializedRenderPipeline for EdgeDetectionPipeline {
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let targets = vec![Some(ColorTargetState {
-            format: if key.hdr {
-                ViewTarget::TEXTURE_FORMAT_HDR
-            } else {
-                TextureFormat::bevy_default()
-            },
+            format: key.target_format,
             blend: None,
             write_mask: ColorWrites::ALL,
         })];
@@ -282,7 +286,7 @@ impl SpecializedRenderPipeline for EdgeDetectionPipeline {
             primitive: default(),
             depth_stencil: None,
             multisample: default(),
-            push_constant_ranges: vec![],
+            immediate_size: 0,
             zero_initialize_workgroup_memory: false,
         }
     }
@@ -296,15 +300,20 @@ pub fn prepare_edge_detection_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<EdgeDetectionPipeline>>,
     edge_detection_pipeline: Res<EdgeDetectionPipeline>,
-    query: Query<(Entity, &EdgeDetection, Option<&Projection>, &ViewTarget)>,
+    query: Query<(
+        Entity,
+        &EdgeDetection,
+        Option<&Projection>,
+        &ExtractedView,
+        &ViewTarget,
+    )>,
 ) {
-    for (entity, edge_detection, projection, view_target) in &query {
+    for (entity, edge_detection, projection, view, view_target) in &query {
         let multisampled = view_target.sampled_main_texture_view().is_some();
-        let hdr = view_target.is_hdr();
         let id = pipelines.specialize(
             &pipeline_cache,
             &edge_detection_pipeline,
-            EdgeDetectionKey::new(edge_detection, hdr, multisampled, projection),
+            EdgeDetectionKey::new(edge_detection, view.target_format, multisampled, projection),
         );
         commands.entity(entity).insert(EdgeDetectionPipelineId(id));
     }
@@ -362,8 +371,8 @@ pub struct EdgeDetectionKey {
     /// Edge detection operator.
     pub operator: EdgeOperator,
 
-    /// Whether we're using HDR.
-    pub hdr: bool,
+    /// The texture format this view renders to (sourced from `ExtractedView::target_format`).
+    pub target_format: TextureFormat,
     /// Whether the render target is multisampled.
     pub multisampled: bool,
     /// The projection type of view
@@ -373,7 +382,7 @@ pub struct EdgeDetectionKey {
 impl EdgeDetectionKey {
     pub fn new(
         edge_detection: &EdgeDetection,
-        hdr: bool,
+        target_format: TextureFormat,
         multisampled: bool,
         projection: Option<&Projection>,
     ) -> Self {
@@ -383,7 +392,7 @@ impl EdgeDetectionKey {
             enable_color: edge_detection.enable_color,
             operator: edge_detection.operator,
 
-            hdr,
+            target_format,
             multisampled,
             projection: projection.into(),
         }
@@ -508,7 +517,7 @@ impl Default for EdgeDetection {
     }
 }
 
-#[derive(Component, Clone, Copy, ShaderType, ExtractComponent)]
+#[derive(Component, Clone, Copy, ShaderType)]
 pub struct EdgeDetectionUniform {
     pub depth_threshold: f32,
     pub normal_threshold: f32,
@@ -572,7 +581,7 @@ impl EdgeDetectionUniform {
         mut commands: Commands,
         mut query: Extract<Query<(RenderEntity, &EdgeDetection)>>,
     ) {
-        if !DEPTH_TEXTURE_SAMPLING_SUPPORTED {
+        if !DEPTH_PREPASS_TEXTURE_SUPPORTED {
             info_once!(
                 "Disable edge detection on this platform because depth textures aren't supported correctly"
             );
@@ -589,144 +598,131 @@ impl EdgeDetectionUniform {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub struct EdgeDetectionLabel;
-
 // ──────────────────────────────────────────────
-//  Render graph nodes
+//  Render pass (a system in the `Core3d` schedule as of Bevy 0.19)
 // ──────────────────────────────────────────────
 
-#[derive(Default)]
-pub struct EdgeDetectionNode;
+/// Runs the edge-detection post-process for the current view.
+///
+/// [`ViewQuery`] fetches the components of the view currently being rendered; if
+/// the view has no [`EdgeDetectionPipelineId`] / [`DynamicUniformIndex`] (i.e. no
+/// [`EdgeDetection`] camera component) the parameter fails validation and the
+/// system is skipped for that view — matching the old `ViewNode` behaviour.
+pub fn edge_detection(
+    view: ViewQuery<(
+        &Msaa,
+        &ViewTarget,
+        &ViewPrepassTextures,
+        &ViewUniformOffset,
+        &DynamicUniformIndex<EdgeDetectionUniform>,
+        &EdgeDetectionPipelineId,
+    )>,
+    edge_detection_pipeline: Res<EdgeDetectionPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+    gpu_images: Res<RenderAssets<GpuImage>>,
+    view_uniforms: Res<ViewUniforms>,
+    ed_uniforms: Res<ComponentUniforms<EdgeDetectionUniform>>,
+    mut ctx: RenderContext,
+) {
+    let (
+        msaa,
+        view_target,
+        prepass_textures,
+        view_uniform_index,
+        ed_uniform_index,
+        edge_detection_pipeline_id,
+    ) = view.into_inner();
 
-impl ViewNode for EdgeDetectionNode {
-    type ViewQuery = (
-        &'static Msaa,
-        &'static ViewTarget,
-        &'static ViewPrepassTextures,
-        &'static ViewUniformOffset,
-        &'static DynamicUniformIndex<EdgeDetectionUniform>,
-        &'static EdgeDetectionPipelineId,
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(edge_detection_pipeline_id.0) else {
+        info!("pipeline not found");
+        return;
+    };
+
+    let (Some(depth_texture), Some(normal_texture)) =
+        (&prepass_textures.depth, &prepass_textures.normal)
+    else {
+        info!("depth or normal texture not found");
+        return;
+    };
+
+    let Some(noise_texture) = gpu_images.get(&edge_detection_pipeline.noise_texture) else {
+        info!("noise texture not found");
+        return;
+    };
+
+    let Some(view_uniforms_binding) = view_uniforms.uniforms.binding() else {
+        info!("view uniforms not found");
+        return;
+    };
+
+    let Some(ed_uniform_binding) = ed_uniforms.uniforms().binding() else {
+        info!("edge detection uniform not found");
+        return;
+    };
+
+    // This will start a new "post process write", obtaining two texture
+    // views from the view target - a `source` and a `destination`.
+    // `source` is the "current" main texture and you _must_ write into
+    // `destination` because calling `post_process_write()` on the
+    // [`ViewTarget`] will internally flip the [`ViewTarget`]'s main
+    // texture to the `destination` texture. Failing to do so will cause
+    // the current main texture information to be lost.
+    let post_process = view_target.post_process_write();
+
+    // The bind_group gets created each frame.
+    //
+    // Normally, you would create a bind_group in the Queue set,
+    // but this doesn't work with the post_process_write().
+    // The reason it doesn't work is because each post_process_write will alternate the source/destination.
+    // The only way to have the correct source/destination for the bind_group
+    // is to make sure you get it during the pass execution.
+    let multisampled = *msaa != Msaa::Off;
+    let bind_group = ctx.render_device().create_bind_group(
+        "edge_detection_bind_group",
+        &pipeline_cache
+            .get_bind_group_layout(edge_detection_pipeline.bind_group_layout(multisampled)),
+        // It's important for this to match the BindGroupLayout defined in the PostProcessPipeline
+        &BindGroupEntries::sequential((
+            // Make sure to use the source view
+            post_process.source,
+            // Use depth prepass
+            &depth_texture.texture.default_view,
+            // Use normal prepass
+            &normal_texture.texture.default_view,
+            // Use simple texture sampler
+            &edge_detection_pipeline.linear_sampler,
+            // nonfiltering sampler for depth
+            &edge_detection_pipeline.nonfiltering_sampler,
+            // Use noise texture
+            &noise_texture.texture_view,
+            // Use noise texture sampler
+            &edge_detection_pipeline.noise_sampler,
+            // view uniform binding
+            view_uniforms_binding,
+            // Set the uniform binding
+            ed_uniform_binding,
+        )),
     );
 
-    fn run(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext,
-        (
-            msaa,
-            view_target,
-            prepass_textures,
-            view_uniform_index,
-            ed_uniform_index,
-            edge_detection_pipeline_id,
-        ): QueryItem<Self::ViewQuery>,
-        world: &World,
-    ) -> Result<(), NodeRunError> {
-        let edge_detection_pipeline = world.resource::<EdgeDetectionPipeline>();
-        let pipeline_cache = world.resource::<PipelineCache>();
+    let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("edge_detection_pass"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: post_process.destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations::default(),
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
 
-        let Some(pipeline) = pipeline_cache
-            .get_render_pipeline(edge_detection_pipeline_id.0)
-        else {
-            info!("pipeline not found");
-            return Ok(());
-        };
-
-        let (Some(depth_texture), Some(normal_texture)) =
-            (&prepass_textures.depth, &prepass_textures.normal)
-        else {
-            info!("depth or normal texture not found");
-            return Ok(());
-        };
-
-        let Some(noise_texture) = world
-            .resource::<RenderAssets<GpuImage>>()
-            .get(&edge_detection_pipeline.noise_texture)
-        else {
-            info!("noise texture not found");
-            return Ok(());
-        };
-
-        let Some(view_uniforms_binding) = world.resource::<ViewUniforms>().uniforms.binding()
-        else {
-            info!("view uniforms not found");
-            return Ok(());
-        };
-
-        let Some(ed_uniform_binding) = world
-            .resource::<ComponentUniforms<EdgeDetectionUniform>>()
-            .uniforms()
-            .binding()
-        else {
-            info!("edge detection uniform not found");
-            return Ok(());
-        };
-
-        // This will start a new "post process write", obtaining two texture
-        // views from the view target - a `source` and a `destination`.
-        // `source` is the "current" main texture and you _must_ write into
-        // `destination` because calling `post_process_write()` on the
-        // [`ViewTarget`] will internally flip the [`ViewTarget`]'s main
-        // texture to the `destination` texture. Failing to do so will cause
-        // the current main texture information to be lost.
-        let post_process = view_target.post_process_write();
-
-        // The bind_group gets created each frame.
-        //
-        // Normally, you would create a bind_group in the Queue set,
-        // but this doesn't work with the post_process_write().
-        // The reason it doesn't work is because each post_process_write will alternate the source/destination.
-        // The only way to have the correct source/destination for the bind_group
-        // is to make sure you get it during the node execution.
-        let multisampled = *msaa != Msaa::Off;
-        let bind_group = render_context.render_device().create_bind_group(
-            "edge_detection_bind_group",
-            &pipeline_cache.get_bind_group_layout(edge_detection_pipeline.bind_group_layout(multisampled)),
-            // It's important for this to match the BindGroupLayout defined in the PostProcessPipeline
-            &BindGroupEntries::sequential((
-                // Make sure to use the source view
-                post_process.source,
-                // Use depth prepass
-                &depth_texture.texture.default_view,
-                // Use normal prepass
-                &normal_texture.texture.default_view,
-                // Use simple texture sampler
-                &edge_detection_pipeline.linear_sampler,
-                // nonfiltering sampler for depth
-                &edge_detection_pipeline.nonfiltering_sampler,
-                // Use noise texture
-                &noise_texture.texture_view,
-                // Use noise texture sampler
-                &edge_detection_pipeline.noise_sampler,
-                // view uniform binding
-                view_uniforms_binding,
-                // Set the uniform binding
-                ed_uniform_binding,
-            )),
-        );
-
-        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("edge_detection_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: post_process.destination,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations::default(),
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        render_pass.set_render_pipeline(pipeline);
-        render_pass.set_bind_group(
-            0,
-            &bind_group,
-            &[view_uniform_index.offset, ed_uniform_index.index()],
-        );
-        render_pass.draw(0..3, 0..1);
-
-        Ok(())
-    }
+    render_pass.set_render_pipeline(pipeline);
+    render_pass.set_bind_group(
+        0,
+        &bind_group,
+        &[view_uniform_index.offset, ed_uniform_index.index()],
+    );
+    render_pass.draw(0..3, 0..1);
 }

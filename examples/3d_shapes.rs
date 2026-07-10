@@ -4,10 +4,7 @@ use bevy::{
     anti_alias::smaa::Smaa,
     asset::RenderAssetUsages,
     color::palettes::basic::SILVER,
-    core_pipeline::{
-        core_3d::graph::Node3d,
-        prepass::{DepthPrepass, NormalPrepass},
-    },
+    core_pipeline::prepass::{DepthPrepass, NormalPrepass},
     input::common_conditions::input_toggle_active,
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
@@ -19,11 +16,9 @@ use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
-        .add_plugins(EdgeDetectionPlugin {
-            // If you wish to apply Smaa anti-aliasing after edge detection,
-            // please ensure that the rendering order of [`EdgeDetectionNode`] is set before [`SmaaNode`].
-            before: Node3d::Smaa,
-        })
+        // Edge detection runs after tonemapping and before the anti-aliasing
+        // passes (FXAA/SMAA), so anti-aliasing smooths the detected outlines.
+        .add_plugins(EdgeDetectionPlugin)
         .add_plugins(EguiPlugin::default())
         .add_plugins(PanOrbitCameraPlugin)
         .add_systems(Startup, (setup, spawn_text))
@@ -111,7 +106,7 @@ fn setup(
 
     commands.spawn((
         PointLight {
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             intensity: 10_000_000.,
             range: 100.0,
             shadow_depth_bias: 0.2,
@@ -133,7 +128,7 @@ fn setup(
             clear_color: Color::WHITE.into(),
             ..default()
         },
-        // [`EdgeDetectionNode`] supports `Msaa``, and you can enable it at any time, for example:
+        // Edge detection supports `Msaa`, and you can enable it at any time, for example:
         // Msaa::default(),
         DepthPrepass::default(),
         NormalPrepass::default(),
