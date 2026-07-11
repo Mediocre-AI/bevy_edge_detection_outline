@@ -10,6 +10,7 @@ A post-processing outline effect for Bevy that detects edges from depth, normals
 
 | Crate version | Bevy version |
 | --- | --- |
+| 0.4.x | 0.19.x |
 | 0.3.x | 0.18.x |
 | 0.2.x | 0.18.x |
 | 0.1.x | 0.17.x |
@@ -138,6 +139,10 @@ Notes:
 - Requires a browser with WebGPU enabled.
 
 ## Changelog
+
+### 0.4.0
+
+- **Bevy 0.19**: the render-graph `ViewNode` is gone — the edge pass now runs as a `Core3d` SYSTEM in `EdgeDetectionPassSet`. Order it against other ViewTarget-writing passes with `configure_sets` (see README usage).
 
 ### 0.3.0
 - **New: `EdgeOperator` enum** — runtime-switchable Sobel (3x3) and Roberts Cross (2x2) operators.

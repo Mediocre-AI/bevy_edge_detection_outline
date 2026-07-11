@@ -8,6 +8,7 @@ authors = ["Jungkwon Lee <deruci89@gmail.com>"]
 description = "Edge detection outline post-processing plugin for Bevy — Sobel, Roberts Cross, and PixelArt operators with silhouette/crease priority, per-entity channel mask, depth/normal/color edge sources (WGSL shader)."
 readme = "README.md"
 homepage = "https://github.com/Mediocre-AI/bevy_edge_detection_outline"
+repository = "https://github.com/Mediocre-AI/bevy_edge_detection_outline"
 keywords = ["bevy", "plugin", "post-processing", "edge-detection"]
 categories = ["game-engines", "graphics", "rendering"]
 
