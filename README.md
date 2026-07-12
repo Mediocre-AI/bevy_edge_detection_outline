@@ -4,7 +4,7 @@
 
 A post-processing outline effect for Bevy that detects edges from depth, normals, and/or color and draws customizable outlines. Supports two edge detection operators — **Sobel** (3x3, wider strokes) and **Roberts Cross** (2x2, clean 1px edges) — switchable at runtime.
 
-![Example](example.PNG)
+![Example](example.png)
 
 ## Version compatibility
 
