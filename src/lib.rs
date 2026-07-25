@@ -30,13 +30,21 @@ use bevy::{
 /// Alpha-channel encoding for per-entity edge mask control.
 /// Set the normal prepass alpha to one of these values to control
 /// which edge detection algorithms apply to that entity.
+///
+/// ⚠ The normal prepass texture is `Rgb10a2Unorm` (bevy_core_pipeline
+/// `NORMAL_PREPASS_FORMAT`): alpha has TWO BITS, so exactly four codes exist
+/// — 0, 1/3, 2/3, 1. The constants below are those four codes verbatim; any
+/// other value quantizes to one of them (a former 0.50 "CREASE_ONLY" level
+/// was unrepresentable next to them and was dropped, unused, 2026-07-25).
 pub mod edge_mask {
     /// Skip all edge detection for this entity (roads, water surfaces).
     pub const SKIP: f32 = 0.0;
     /// Silhouette (depth) edges only — suppresses crease (normal) edges.
-    pub const SILHOUETTE_ONLY: f32 = 0.25;
-    /// Crease (normal) edges only — suppresses silhouette (depth) edges.
-    pub const CREASE_ONLY: f32 = 0.50;
+    pub const SILHOUETTE_ONLY: f32 = 1.0 / 3.0;
+    /// Both edge types, drawn in `EdgeDetection::highlight_color` instead of
+    /// the normal silhouette/crease colors — per-entity hover/selection
+    /// accent (e.g. gold outline on the hovered unit/model).
+    pub const HIGHLIGHT: f32 = 2.0 / 3.0;
     /// Both silhouette and crease edges (default for StandardMaterial).
     pub const BOTH: f32 = 1.0;
 }
@@ -461,6 +469,11 @@ pub struct EdgeDetection {
     /// Separate color for crease (normal) edges. `None` inherits `edge_color`.
     pub crease_color: Option<Color>,
 
+    /// Accent color for entities whose prepass mask is `edge_mask::HIGHLIGHT`
+    /// (2/3): their silhouette AND crease edges are drawn in this color —
+    /// a per-entity hover/selection outline that needs no extra pass.
+    pub highlight_color: Color,
+
     /// Whether to enable depth-based edge detection.
     /// If `true`, edges will be detected based on depth variations.
     pub enable_depth: bool,
@@ -503,6 +516,8 @@ impl Default for EdgeDetection {
             edge_color: Color::BLACK,
             silhouette_color: None,
             crease_color: None,
+            // 잘 보이는 골드 — hover/선택 하이라이트의 기본값.
+            highlight_color: Color::srgb(0.95, 0.72, 0.12),
 
             enable_depth: true,
             enable_normal: true,
@@ -536,6 +551,7 @@ pub struct EdgeDetectionUniform {
 
     pub silhouette_color: LinearRgba,
     pub crease_color: LinearRgba,
+    pub highlight_color: LinearRgba,
 
     pub block_pixel: u32,
     pub flat_rejection_threshold: f32,
@@ -569,6 +585,7 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
                 .map(|c| c.into())
                 .unwrap_or(edge_linear),
             crease_color: ed.crease_color.map(|c| c.into()).unwrap_or(edge_linear),
+            highlight_color: ed.highlight_color.into(),
 
             block_pixel: ed.block_pixel,
             flat_rejection_threshold: ed.flat_rejection_threshold,

@@ -53,6 +53,7 @@ struct EdgeDetectionUniform {
 
     silhouette_color: vec4f,
     crease_color: vec4f,
+    highlight_color: vec4f,
 
     block_pixel: u32,
     flat_rejection_threshold: f32,
@@ -250,12 +251,19 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
 // -----------------------
 
 /// Decode the normal prepass alpha into (enable_silhouette, enable_crease).
-/// Alpha encoding: 0.0=SKIP, 0.25=SILHOUETTE_ONLY, 0.50=CREASE_ONLY, 0.75~1.0=BOTH
+/// The prepass texture is Rgb10a2Unorm — alpha is TWO BITS, four codes:
+/// 0=SKIP, 1/3=SILHOUETTE_ONLY, 2/3=HIGHLIGHT (both edges, highlight_color),
+/// 1=BOTH. Thresholds sit between adjacent codes.
 fn decode_edge_mask(alpha: f32) -> vec2<bool> {
-    if (alpha < 0.125) { return vec2<bool>(false, false); }
-    else if (alpha < 0.375) { return vec2<bool>(true, false); }
-    else if (alpha < 0.625) { return vec2<bool>(false, true); }
+    if (alpha < 0.1667) { return vec2<bool>(false, false); }
+    else if (alpha < 0.5) { return vec2<bool>(true, false); }
     else { return vec2<bool>(true, true); }
+}
+
+/// HIGHLIGHT code (2/3) of the mask encoding: this entity's edges use
+/// ed_uniform.highlight_color (per-entity hover/selection accent).
+fn is_highlight_mask(alpha: f32) -> bool {
+    return alpha >= 0.5 && alpha < 0.8333;
 }
 
 // -----------------------
@@ -266,7 +274,7 @@ fn decode_edge_mask(alpha: f32) -> vec2<bool> {
 
 /// UDLR pairwise normal comparison for crease detection.
 /// Directional tie-breaking: only marks one side to ensure 1px crease edges.
-/// If the neighbor is SKIP (alpha < 0.125), center always wins — otherwise
+/// If the neighbor is SKIP (alpha < 0.1667), center always wins — otherwise
 /// the edge would be lost because the SKIP side never draws edges.
 fn check_crease(uv: vec2f, offset: vec2f) -> bool {
     let n_center = prepass_normal(uv);
@@ -277,7 +285,7 @@ fn check_crease(uv: vec2f, offset: vec2f) -> bool {
         return false;
     }
     // If neighbor is SKIP, center always wins (SKIP side won't draw any edge).
-    if (raw_neighbor.a < 0.125) {
+    if (raw_neighbor.a < 0.1667) {
         return true;
     }
     // Tie-break: only mark on the pixel with larger component sum.
@@ -330,7 +338,12 @@ fn fragment(
     let uv_px = pixelate_uv(in.uv, texture_size, f32(block_pixel));
 
     var edge = 0.0;
+    var edge_from_color = false;
     var resolved_edge_color = ed_uniform.edge_color;
+    // Per-entity mask alpha of the CENTER pixel: silhouettes draw on the
+    // foreground side and creases tie-break within one object, so the center
+    // sample is the entity that owns whatever edge we resolve below.
+    let center_mask_alpha = prepass_normal_raw(uv_noise_px).a;
 
 #ifdef OPERATOR_PIXEL_ART
     // PixelArt operator: UDLR pairwise comparison with silhouette/crease priority.
@@ -344,7 +357,7 @@ fn fragment(
     );
 
     // Decode per-entity edge mask from normal prepass alpha
-    let mask = decode_edge_mask(prepass_normal_raw(uv_noise_px).a);
+    let mask = decode_edge_mask(center_mask_alpha);
 
     var is_silhouette = false;
     var is_crease = false;
@@ -374,7 +387,7 @@ fn fragment(
                 // Only suppress crease if the foreground neighbor is non-SKIP,
                 // because a SKIP neighbor won't draw its own silhouette edge.
                 let neighbor_alpha = prepass_normal_raw(uv_noise_px + offsets[i]).a;
-                if (neighbor_alpha >= 0.125) {
+                if (neighbor_alpha >= 0.1667) {
                     at_depth_boundary = true;
                 }
             }
@@ -410,6 +423,7 @@ fn fragment(
         let edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
         if (edge_color_val > 0.0) {
             edge = 1.0;
+            edge_from_color = true;
             resolved_edge_color = ed_uniform.edge_color;
         }
     }
@@ -440,11 +454,47 @@ fn fragment(
         let edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
         if (edge_color_val > 0.0) {
             edge = 1.0;
+            edge_from_color = true;
             resolved_edge_color = ed_uniform.edge_color;
         }
     }
 #endif
 #endif  // OPERATOR_PIXEL_ART
+
+    // HIGHLIGHT accent (mask code 2/3): this entity's edges — silhouette,
+    // crease, or color — are drawn in highlight_color (hover/selection).
+    // Ownership: positive-axis kernels (Sobel/RobertsCross always; the color
+    // detector in EVERY operator) can detect an object's left/top edge on the
+    // NEIGHBOR fragment, so the center sample may belong to the background —
+    // probe the producing kernel's footprint then. PixelArt silhouette/crease
+    // are center-owned by construction (directional foreground test /
+    // tie-break) and skip the probe. Bleed onto a touching object's boundary
+    // is fine: that boundary is visually the highlighted object's silhouette.
+    if (edge > 0.0) {
+        var highlight_owner = is_highlight_mask(center_mask_alpha);
+        var probe_t = 0.0;
+#ifdef OPERATOR_PIXEL_ART
+        if (edge_from_color) {
+            probe_t = max(ed_uniform.color_thickness, 1.0);
+        }
+#else
+        probe_t = max(max(ed_uniform.depth_thickness, ed_uniform.normal_thickness), 1.0);
+#ifdef ENABLE_COLOR
+        probe_t = max(probe_t, ed_uniform.color_thickness);
+#endif
+#endif
+        if (!highlight_owner && probe_t > 0.0) {
+            for (var iy = -1; iy <= 1; iy++) {
+                for (var ix = -1; ix <= 1; ix++) {
+                    let a = prepass_normal_raw(uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * probe_t).a;
+                    if (is_highlight_mask(a)) { highlight_owner = true; }
+                }
+            }
+        }
+        if (highlight_owner) {
+            resolved_edge_color = ed_uniform.highlight_color;
+        }
+    }
 
     // Edge mask: suppress edges on pixels marked with alpha=0.0 in normal prepass.
     // Materials using the NoEdgeExtension write alpha=0.0 (e.g. hex tile surfaces).
