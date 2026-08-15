@@ -13,7 +13,7 @@ keywords = ["bevy", "plugin", "post-processing", "edge-detection"]
 categories = ["game-engines", "graphics", "rendering"]
 
 [dependencies]
-bevy = { version = "0.19", features = ["webgpu"] }
+bevy = { version = "0.19.1", features = ["webgpu"] }
 
 [dev-dependencies]
 bevy_egui = "0.40"
