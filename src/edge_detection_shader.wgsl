@@ -54,6 +54,7 @@ struct EdgeDetectionUniform {
     silhouette_color: vec4f,
     crease_color: vec4f,
     highlight_color: vec4f,
+    highlight_thickness: f32,
 
     block_pixel: u32,
     flat_rejection_threshold: f32,
@@ -344,11 +345,20 @@ fn fragment(
     // foreground side and creases tie-break within one object, so the center
     // sample is the entity that owns whatever edge we resolve below.
     let center_mask_alpha = prepass_normal_raw(uv_noise_px).a;
+    let center_is_highlight = is_highlight_mask(center_mask_alpha);
 
 #ifdef OPERATOR_PIXEL_ART
     // PixelArt operator: UDLR pairwise comparison with silhouette/crease priority.
     let px_offset = vec2f(block_pixel, block_pixel) / texture_size;
 
+    // Keep the authored one-pixel checks, then add a slightly wider set only
+    // for a HIGHLIGHT owner. This remains part of the same edge-detection pass
+    // and does not widen the ordinary black edges elsewhere in the view.
+    let highlight_scale = select(
+        1.0,
+        max(ed_uniform.highlight_thickness, 1.0),
+        center_is_highlight,
+    );
     let offsets = array<vec2f, 4>(
         vec2f(0.0, px_offset.y),   // Down (+y in UV space)
         vec2f(0.0, -px_offset.y),  // Up
@@ -392,6 +402,24 @@ fn fragment(
                 }
             }
         }
+        if (!is_silhouette && center_is_highlight && highlight_scale > 1.0) {
+            for (var i = 0; i < 4; i++) {
+                let hover_offset = offsets[i] * highlight_scale;
+                let neighbor_z = prepass_view_z(uv_noise_px + hover_offset);
+                let diff = center_z - neighbor_z;
+                if (diff > threshold) {
+                    is_silhouette = true;
+                    at_depth_boundary = true;
+                    break;
+                }
+                if (-diff > threshold) {
+                    let neighbor_alpha = prepass_normal_raw(uv_noise_px + hover_offset).a;
+                    if (neighbor_alpha >= 0.1667) {
+                        at_depth_boundary = true;
+                    }
+                }
+            }
+        }
     }
 #endif
 
@@ -404,6 +432,14 @@ fn fragment(
             if (check_crease(uv_noise_px, offsets[j])) {
                 is_crease = true;
                 break;
+            }
+        }
+        if (!is_crease && center_is_highlight && highlight_scale > 1.0) {
+            for (var j = 0; j < 4; j++) {
+                if (check_crease(uv_noise_px, offsets[j] * highlight_scale)) {
+                    is_crease = true;
+                    break;
+                }
             }
         }
     }
@@ -432,7 +468,14 @@ fn fragment(
 #else
     // Sobel / Roberts Cross operators with silhouette/crease priority.
 #ifdef ENABLE_DEPTH
-    let edge_depth = detect_edge_depth(uv_noise_px, ed_uniform.depth_thickness, fresnel);
+    var edge_depth = detect_edge_depth(uv_noise_px, ed_uniform.depth_thickness, fresnel);
+    if (edge_depth <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
+        edge_depth = detect_edge_depth(
+            uv_noise_px,
+            ed_uniform.depth_thickness * ed_uniform.highlight_thickness,
+            fresnel,
+        );
+    }
     if (edge_depth > 0.0) {
         edge = 1.0;
         resolved_edge_color = ed_uniform.silhouette_color;
@@ -441,7 +484,13 @@ fn fragment(
 
 #ifdef ENABLE_NORMAL
     if (edge < 1.0) {
-        let edge_normal = detect_edge_normal(uv_noise_px, ed_uniform.normal_thickness);
+        var edge_normal = detect_edge_normal(uv_noise_px, ed_uniform.normal_thickness);
+        if (edge_normal <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
+            edge_normal = detect_edge_normal(
+                uv_noise_px,
+                ed_uniform.normal_thickness * ed_uniform.highlight_thickness,
+            );
+        }
         if (edge_normal > 0.0) {
             edge = 1.0;
             resolved_edge_color = ed_uniform.crease_color;
@@ -451,7 +500,13 @@ fn fragment(
 
 #ifdef ENABLE_COLOR
     if (edge < 1.0) {
-        let edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
+        var edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
+        if (edge_color_val <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
+            edge_color_val = detect_edge_color(
+                uv_noise_px,
+                ed_uniform.color_thickness * ed_uniform.highlight_thickness,
+            );
+        }
         if (edge_color_val > 0.0) {
             edge = 1.0;
             edge_from_color = true;

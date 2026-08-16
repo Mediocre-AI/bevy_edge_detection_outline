@@ -473,6 +473,10 @@ pub struct EdgeDetection {
     /// (2/3): their silhouette AND crease edges are drawn in this color —
     /// a per-entity hover/selection outline that needs no extra pass.
     pub highlight_color: Color,
+    /// Sampling-radius multiplier used only for `edge_mask::HIGHLIGHT` pixels.
+    /// Values above 1.0 make a hovered/selected edge appear thicker without
+    /// widening the ordinary edges of every other entity in the view.
+    pub highlight_thickness: f32,
 
     /// Whether to enable depth-based edge detection.
     /// If `true`, edges will be detected based on depth variations.
@@ -518,6 +522,7 @@ impl Default for EdgeDetection {
             crease_color: None,
             // 잘 보이는 골드 — hover/선택 하이라이트의 기본값.
             highlight_color: Color::srgb(0.95, 0.72, 0.12),
+            highlight_thickness: 1.0,
 
             enable_depth: true,
             enable_normal: true,
@@ -552,6 +557,7 @@ pub struct EdgeDetectionUniform {
     pub silhouette_color: LinearRgba,
     pub crease_color: LinearRgba,
     pub highlight_color: LinearRgba,
+    pub highlight_thickness: f32,
 
     pub block_pixel: u32,
     pub flat_rejection_threshold: f32,
@@ -586,6 +592,7 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
                 .unwrap_or(edge_linear),
             crease_color: ed.crease_color.map(|c| c.into()).unwrap_or(edge_linear),
             highlight_color: ed.highlight_color.into(),
+            highlight_thickness: ed.highlight_thickness,
 
             block_pixel: ed.block_pixel,
             flat_rejection_threshold: ed.flat_rejection_threshold,
