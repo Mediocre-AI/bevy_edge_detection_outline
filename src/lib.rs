@@ -458,6 +458,7 @@ pub struct EdgeDetection {
     /// Strength of UV distortion applied to the edge detection process.
     /// This controls the intensity of the distortion effect.
     /// Higher values result in more pronounced distortion.
+    /// Defaults to zero so edges align with the source image; zero frequency alone does not disable distortion.
     pub uv_distortion_strength: Vec2,
 
     /// Edge color, used to draw the detected edges.
@@ -515,7 +516,7 @@ impl Default for EdgeDetection {
             steep_angle_multiplier: 0.30,
 
             uv_distortion_frequency: Vec2::splat(0.0),
-            uv_distortion_strength: Vec2::splat(0.004),
+            uv_distortion_strength: Vec2::ZERO,
 
             edge_color: Color::BLACK,
             silhouette_color: None,
