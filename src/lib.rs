@@ -57,7 +57,7 @@ pub struct EdgeDetectionPlugin;
 
 impl Plugin for EdgeDetectionPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "edge_detection_shader.wgsl");
+        embedded_asset!(app, "edge_detection_shader.wesl");
         embedded_asset!(app, "perlin_noise.png");
 
         app.register_type::<EdgeDetection>();
@@ -113,7 +113,7 @@ pub struct EdgeDetectionPassSet;
 // from the camera in the main world: the render pass's `ViewQuery` matches on
 // the pipeline-id + uniform-index pair, so leaving those behind keeps the
 // pass running with stale state after the effect is disabled.
-impl SyncComponent for EdgeDetection {
+impl SyncComponent<RenderApp> for EdgeDetection {
     type Target = (
         EdgeDetection,
         EdgeDetectionUniform,
@@ -147,7 +147,7 @@ impl EdgeDetectionPipeline {
 
 impl FromWorld for EdgeDetectionPipeline {
     fn from_world(world: &mut World) -> Self {
-        let shader = load_embedded_asset!(world, "edge_detection_shader.wgsl");
+        let shader = load_embedded_asset!(world, "edge_detection_shader.wesl");
         let noise_texture = load_embedded_asset!(world, "perlin_noise.png");
 
         let layout_with_msaa = BindGroupLayoutDescriptor::new(
@@ -290,6 +290,7 @@ impl SpecializedRenderPipeline for EdgeDetectionPipeline {
                 shader_defs,
                 entry_point: Some("fragment".into()),
                 targets,
+                ..default()
             }),
             primitive: default(),
             depth_stencil: None,

@@ -7,23 +7,21 @@
 //!   - OPERATOR_PIXEL_ART:    UDLR 4-direction pairwise comparison — 1px guaranteed, silhouette/crease
 //!                            priority, per-entity channel mask (alpha encoding).
 
-#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import bevy_render::view::View
-#import bevy_pbr::view_transformations::uv_to_ndc
+import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
+import bevy_render::view::View;
+import bevy_pbr::render::view_transformations::uv_to_ndc;
 
 @group(0) @binding(0) var screen_texture: texture_2d<f32>;
 
-#ifdef MULTISAMPLED
+@if(MULTISAMPLED)
 @group(0) @binding(1) var depth_prepass_texture: texture_depth_multisampled_2d;
-#else
+@else
 @group(0) @binding(1) var depth_prepass_texture: texture_depth_2d;
-#endif
 
-#ifdef MULTISAMPLED
+@if(MULTISAMPLED)
 @group(0) @binding(2) var normal_prepass_texture: texture_multisampled_2d<f32>;
-#else
+@else
 @group(0) @binding(2) var normal_prepass_texture: texture_2d<f32>;
-#endif
 
 @group(0) @binding(3) var filtering_sampler: sampler;
 @group(0) @binding(4) var depth_sampler: sampler;
@@ -74,14 +72,14 @@ fn perspective_camera_near() -> f32 {
 /// Convert ndc depth to linear view z. 
 /// Note: Depth values in front of the camera will be negative as -z is forward
 fn depth_ndc_to_view_z(ndc_depth: f32) -> f32 {
-#ifdef VIEW_PROJECTION_PERSPECTIVE
+@if(VIEW_PROJECTION_PERSPECTIVE) {
     return -perspective_camera_near() / ndc_depth;
-#else ifdef VIEW_PROJECTION_ORTHOGRAPHIC
+} @elif(VIEW_PROJECTION_ORTHOGRAPHIC) {
     return -(view.clip_from_view[3][2] - ndc_depth) / view.clip_from_view[2][2];
-#else
+} @else {
     let view_pos = view.view_from_clip * vec4f(0.0, 0.0, ndc_depth, 1.0);
     return view_pos.z / view_pos.w;
-#endif
+}
 }
 
 /// Convert a ndc space position to world space
@@ -91,13 +89,13 @@ fn position_ndc_to_world(ndc_pos: vec3<f32>) -> vec3<f32> {
 }
 
 fn calculate_view(world_position: vec3f) -> vec3f {
-#ifdef VIEW_PROJECTION_ORTHOGRAPHIC
+@if(VIEW_PROJECTION_ORTHOGRAPHIC) {
         // Orthographic view vector
         return normalize(vec3f(view.clip_from_world[0].z, view.clip_from_world[1].z, view.clip_from_world[2].z));
-#else
+} @else {
         // Only valid for a perspective projection
         return normalize(view.world_position.xyz - world_position.xyz);
-#endif
+}
 }
 
 // -----------------------
@@ -105,12 +103,12 @@ fn calculate_view(world_position: vec3f) -> vec3f {
 // -----------------------
 
 fn prepass_depth(uv: vec2f) -> f32 {
-#ifdef MULTISAMPLED
+@if(MULTISAMPLED) {
     let pixel_coord = vec2i(uv * texture_size);
     let depth = textureLoad(depth_prepass_texture, pixel_coord, sample_index_i);
-#else
+} @else {
     let depth = textureSample(depth_prepass_texture, depth_sampler, uv);
-#endif
+}
     return depth;
 }
 
@@ -122,7 +120,7 @@ fn prepass_view_z(uv: vec2f) -> f32 {
 fn detect_edge_depth(uv: vec2f, thickness: f32, fresnel: f32) -> f32 {
     let offset = texel_size * thickness;
 
-#ifdef OPERATOR_SOBEL
+@if(OPERATOR_SOBEL) {
     // 3x3 Sobel: horizontal/vertical gradient from 8 neighbors
     let d_tl = prepass_view_z(uv + vec2f(-offset.x,  offset.y));
     let d_t  = prepass_view_z(uv + vec2f(      0.0,  offset.y));
@@ -137,7 +135,7 @@ fn detect_edge_depth(uv: vec2f, thickness: f32, fresnel: f32) -> f32 {
     let gy = -d_tl - 2.0*d_t - d_tr + d_bl + 2.0*d_b + d_br;
     let grad = max(abs(gx), abs(gy));
     let view_z = abs(prepass_view_z(uv));
-#else
+} @else {
     // 2x2 Roberts Cross: diagonal differences from 4 samples
     let d00 = prepass_view_z(uv);
     let d10 = prepass_view_z(uv + vec2f(offset.x, 0.0));
@@ -148,7 +146,7 @@ fn detect_edge_depth(uv: vec2f, thickness: f32, fresnel: f32) -> f32 {
     let diff_diag1 = d10 - d01;
     let grad = max(abs(diff_diag0), abs(diff_diag1));
     let view_z = abs(d00);
-#endif
+}
 
     let steep_angle_adjustment =
         smoothstep(ed_uniform.steep_angle_threshold, 1.0, fresnel) * ed_uniform.steep_angle_multiplier * view_z;
@@ -170,19 +168,19 @@ fn prepass_normal(uv: vec2f) -> vec3f {
 }
 
 fn prepass_normal_raw(uv: vec2f) -> vec4f {
-#ifdef MULTISAMPLED
+@if(MULTISAMPLED) {
     let pixel_coord = vec2i(uv * texture_size);
     let normal = textureLoad(normal_prepass_texture, pixel_coord, sample_index_i);
-#else
+} @else {
     let normal = textureSample(normal_prepass_texture, filtering_sampler, uv);
-#endif
+}
     return normal;
 }
 
 fn detect_edge_normal(uv: vec2f, thickness: f32) -> f32 {
     let offset = texel_size * thickness;
 
-#ifdef OPERATOR_SOBEL
+@if(OPERATOR_SOBEL) {
     let n_tl = prepass_normal(uv + vec2f(-offset.x,  offset.y));
     let n_t  = prepass_normal(uv + vec2f(      0.0,  offset.y));
     let n_tr = prepass_normal(uv + vec2f( offset.x,  offset.y));
@@ -195,7 +193,7 @@ fn detect_edge_normal(uv: vec2f, thickness: f32) -> f32 {
     let gx = -n_tl - 2.0*n_l - n_bl + n_tr + 2.0*n_r + n_br;
     let gy = -n_tl - 2.0*n_t - n_tr + n_bl + 2.0*n_b + n_br;
     let grad = sqrt(dot(gx, gx) + dot(gy, gy));
-#else
+} @else {
     let n00 = prepass_normal(uv);
     let n10 = prepass_normal(uv + vec2f(offset.x, 0.0));
     let n01 = prepass_normal(uv + vec2f(0.0, offset.y));
@@ -204,7 +202,7 @@ fn detect_edge_normal(uv: vec2f, thickness: f32) -> f32 {
     let diff0 = n00 - n11;
     let diff1 = n10 - n01;
     let grad = sqrt(dot(diff0, diff0) + dot(diff1, diff1));
-#endif
+}
 
     return f32(grad > ed_uniform.normal_threshold);
 }
@@ -220,7 +218,7 @@ fn prepass_color(uv: vec2f) -> vec3f {
 fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
     let offset = texel_size * thickness;
 
-#ifdef OPERATOR_SOBEL
+@if(OPERATOR_SOBEL) {
     let c_tl = prepass_color(uv + vec2f(-offset.x,  offset.y));
     let c_t  = prepass_color(uv + vec2f(      0.0,  offset.y));
     let c_tr = prepass_color(uv + vec2f( offset.x,  offset.y));
@@ -233,7 +231,7 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
     let gx = -c_tl - 2.0*c_l - c_bl + c_tr + 2.0*c_r + c_br;
     let gy = -c_tl - 2.0*c_t - c_tr + c_bl + 2.0*c_b + c_br;
     let grad = sqrt(dot(gx, gx) + dot(gy, gy));
-#else
+} @else {
     let c00 = prepass_color(uv);
     let c10 = prepass_color(uv + vec2f(offset.x, 0.0));
     let c01 = prepass_color(uv + vec2f(0.0, offset.y));
@@ -242,7 +240,7 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
     let diff0 = c00 - c11;
     let diff1 = c10 - c01;
     let grad = sqrt(dot(diff0, diff0) + dot(diff1, diff1));
-#endif
+}
 
     return f32(grad > ed_uniform.color_threshold);
 }
@@ -271,12 +269,11 @@ fn is_highlight_mask(alpha: f32) -> bool {
 // PixelArt Operator ------
 // -----------------------
 
-#ifdef OPERATOR_PIXEL_ART
-
 /// UDLR pairwise normal comparison for crease detection.
 /// Directional tie-breaking: only marks one side to ensure 1px crease edges.
 /// If the neighbor is SKIP (alpha < 0.1667), center always wins — otherwise
 /// the edge would be lost because the SKIP side never draws edges.
+@if(OPERATOR_PIXEL_ART)
 fn check_crease(uv: vec2f, offset: vec2f) -> bool {
     let n_center = prepass_normal(uv);
     let raw_neighbor = prepass_normal_raw(uv + offset);
@@ -295,8 +292,6 @@ fn check_crease(uv: vec2f, offset: vec2f) -> bool {
     return sum_c >= sum_n;
 }
 
-#endif
-
 fn pixelate_uv(uv: vec2f, dims: vec2f, block_px: f32) -> vec2f {
     let b = max(block_px, 1.0);
     let cell = floor(uv * dims / b);
@@ -310,14 +305,12 @@ var<private> sample_index_i: i32 = 0;
 
 @fragment
 fn fragment(
-#ifdef MULTISAMPLED
-    @builtin(sample_index) sample_index: u32,
-#endif
+    @if(MULTISAMPLED) @builtin(sample_index) sample_index: u32,
     in: FullscreenVertexOutput
 ) -> @location(0) vec4f {
-#ifdef MULTISAMPLED
+@if(MULTISAMPLED) {
     sample_index_i = i32(sample_index);
-#endif
+}
 
     texture_size = vec2f(textureDimensions(screen_texture, 0));
     texel_size = 1.0 / texture_size;
@@ -347,7 +340,7 @@ fn fragment(
     let center_mask_alpha = prepass_normal_raw(uv_noise_px).a;
     let center_is_highlight = is_highlight_mask(center_mask_alpha);
 
-#ifdef OPERATOR_PIXEL_ART
+@if(OPERATOR_PIXEL_ART) {
     // PixelArt operator: UDLR pairwise comparison with silhouette/crease priority.
     let px_offset = vec2f(block_pixel, block_pixel) / texture_size;
 
@@ -375,7 +368,7 @@ fn fragment(
 
     // 1) Silhouette search — directional: only foreground pixel gets the edge.
     //    Also tracks if we're at ANY depth boundary (either side) to suppress crease.
-#ifdef ENABLE_DEPTH
+@if(ENABLE_DEPTH) {
     if (mask.x) {
         let center_z = prepass_view_z(uv_noise_px);
         let view_z = abs(center_z);
@@ -421,12 +414,12 @@ fn fragment(
             }
         }
     }
-#endif
+}
 
     // 2) Crease search — skip if silhouette found OR at a depth boundary.
     //    Suppressing crease at depth boundaries prevents the background pixel
     //    from drawing a false crease (different objects = different normals).
-#ifdef ENABLE_NORMAL
+@if(ENABLE_NORMAL) {
     if (!is_silhouette && !at_depth_boundary && mask.y) {
         for (var j = 0; j < 4; j++) {
             if (check_crease(uv_noise_px, offsets[j])) {
@@ -443,7 +436,7 @@ fn fragment(
             }
         }
     }
-#endif
+}
 
     // 3) Type-specific color
     if (is_silhouette) {
@@ -454,7 +447,7 @@ fn fragment(
         resolved_edge_color = ed_uniform.crease_color;
     }
 
-#ifdef ENABLE_COLOR
+@if(ENABLE_COLOR) {
     if (edge < 1.0) {
         let edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
         if (edge_color_val > 0.0) {
@@ -463,11 +456,11 @@ fn fragment(
             resolved_edge_color = ed_uniform.edge_color;
         }
     }
-#endif
+}
 
-#else
+} @else {
     // Sobel / Roberts Cross operators with silhouette/crease priority.
-#ifdef ENABLE_DEPTH
+@if(ENABLE_DEPTH) {
     var edge_depth = detect_edge_depth(uv_noise_px, ed_uniform.depth_thickness, fresnel);
     if (edge_depth <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
         edge_depth = detect_edge_depth(
@@ -480,9 +473,9 @@ fn fragment(
         edge = 1.0;
         resolved_edge_color = ed_uniform.silhouette_color;
     }
-#endif
+}
 
-#ifdef ENABLE_NORMAL
+@if(ENABLE_NORMAL) {
     if (edge < 1.0) {
         var edge_normal = detect_edge_normal(uv_noise_px, ed_uniform.normal_thickness);
         if (edge_normal <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
@@ -496,9 +489,9 @@ fn fragment(
             resolved_edge_color = ed_uniform.crease_color;
         }
     }
-#endif
+}
 
-#ifdef ENABLE_COLOR
+@if(ENABLE_COLOR) {
     if (edge < 1.0) {
         var edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
         if (edge_color_val <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
@@ -513,8 +506,8 @@ fn fragment(
             resolved_edge_color = ed_uniform.edge_color;
         }
     }
-#endif
-#endif  // OPERATOR_PIXEL_ART
+}
+}
 
     // HIGHLIGHT accent (mask code 2/3): this entity's edges — silhouette,
     // crease, or color — are drawn in highlight_color (hover/selection).
@@ -528,16 +521,16 @@ fn fragment(
     if (edge > 0.0) {
         var highlight_owner = is_highlight_mask(center_mask_alpha);
         var probe_t = 0.0;
-#ifdef OPERATOR_PIXEL_ART
+@if(OPERATOR_PIXEL_ART) {
         if (edge_from_color) {
             probe_t = max(ed_uniform.color_thickness, 1.0);
         }
-#else
+} @else {
         probe_t = max(max(ed_uniform.depth_thickness, ed_uniform.normal_thickness), 1.0);
-#ifdef ENABLE_COLOR
+@if(ENABLE_COLOR) {
         probe_t = max(probe_t, ed_uniform.color_thickness);
-#endif
-#endif
+}
+}
         if (!highlight_owner && probe_t > 0.0) {
             for (var iy = -1; iy <= 1; iy++) {
                 for (var ix = -1; ix <= 1; ix++) {
@@ -560,7 +553,7 @@ fn fragment(
     // the 4-level alpha encoding (SKIP/SILHOUETTE_ONLY/CREASE_ONLY/BOTH).
     // This legacy suppression uses alpha < 0.5 as "no-edge", which would incorrectly
     // suppress SILHOUETTE_ONLY (alpha=0.25). Skip it for PixelArt.
-#ifndef OPERATOR_PIXEL_ART
+@if(!OPERATOR_PIXEL_ART) {
     if (edge > 0.0) {
         let center_raw = prepass_normal_raw(uv_noise_px);
         if (center_raw.a < 0.5) {
@@ -580,7 +573,7 @@ fn fragment(
             }
         }
     }
-#endif
+}
 
     // Flat surface rejection (fallback for StandardMaterial entities without custom prepass)
     if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0) {
