@@ -1,0 +1,5 @@
+# Keep this excluded crate's artifacts in its own target/ — Cargo config
+# discovery ignores workspace `exclude`, so without this override the repo-root
+# .cargo/config.toml would redirect builds (and break scripts reading ./target).
+[build]
+target-dir = "target"
