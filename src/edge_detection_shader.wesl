@@ -253,7 +253,7 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
 
 /// Decode the normal prepass alpha into (enable_silhouette, enable_crease).
 /// The prepass texture is Rgb10a2Unorm — alpha is TWO BITS, four codes:
-/// 0=SKIP, 1/3=SILHOUETTE_ONLY, 2/3=HIGHLIGHT (both edges, highlight_color),
+/// 0=SKIP, 1/3=SILHOUETTE_ONLY, 2/3=HIGHLIGHT (both edges plus the accent),
 /// 1=BOTH. Thresholds sit between adjacent codes.
 fn decode_edge_mask(alpha: f32) -> vec2<bool> {
     if (alpha < 0.1667) { return vec2<bool>(false, false); }
@@ -261,8 +261,11 @@ fn decode_edge_mask(alpha: f32) -> vec2<bool> {
     else { return vec2<bool>(true, true); }
 }
 
-/// HIGHLIGHT code (2/3) of the mask encoding: this entity's edges use
-/// ed_uniform.highlight_color (per-entity hover/selection accent).
+/// The screen value above which a pixel counts as an emitter (romance #907).
+const EMITTER_LEVEL: f32 = 1.6;
+
+/// HIGHLIGHT code (2/3) of the mask encoding: the per-entity hover/selection
+/// accent in ed_uniform.highlight_color.
 fn is_highlight_mask(alpha: f32) -> bool {
     return alpha >= 0.5 && alpha < 0.8333;
 }
@@ -336,6 +339,9 @@ fn fragment(
     var edge = 0.0;
     var edge_from_color = false;
     var resolved_edge_color = ed_uniform.edge_color;
+    // A HIGHLIGHT entity's outer contour: its pixels that touch anything that
+    // is not it (PixelArt operator).
+    var at_highlight_contour = false;
     // Per-entity mask alpha of the CENTER pixel: silhouettes draw on the
     // foreground side and creases tie-break within one object, so the center
     // sample is the entity that owns whatever edge we resolve below.
@@ -346,9 +352,8 @@ fn fragment(
     // PixelArt operator: UDLR pairwise comparison with silhouette/crease priority.
     let px_offset = vec2f(block_pixel, block_pixel) / texture_size;
 
-    // Keep the authored one-pixel checks, then add a slightly wider set only
-    // for a HIGHLIGHT owner. This remains part of the same edge-detection pass
-    // and does not widen the ordinary black edges elsewhere in the view.
+    // A HIGHLIGHT entity's contour reaches this many pixels in; ordinary edges
+    // everywhere (its inner ones included) keep the authored one-pixel checks.
     let highlight_scale = select(
         1.0,
         max(ed_uniform.highlight_thickness, 1.0),
@@ -363,6 +368,21 @@ fn fragment(
 
     // Decode per-entity edge mask from normal prepass alpha
     let mask = decode_edge_mask(center_mask_alpha);
+
+    // A hovered or selected entity (HIGHLIGHT) is outlined only where its pixels
+    // meet anything that is not it — one outer contour in highlight_color, as
+    // wide as highlight_thickness. Its inner lines stay ordinary edges.
+    if (center_is_highlight) {
+        let reach = i32(ceil(highlight_scale));
+        for (var k = 1; k <= reach; k++) {
+            for (var i = 0; i < 4; i++) {
+                let neighbor_alpha = prepass_normal_raw(uv_noise_px + offsets[i] * f32(k)).a;
+                if (!is_highlight_mask(neighbor_alpha)) {
+                    at_highlight_contour = true;
+                }
+            }
+        }
+    }
 
     var is_silhouette = false;
     var is_crease = false;
@@ -397,24 +417,6 @@ fn fragment(
                 }
             }
         }
-        if (!is_silhouette && center_is_highlight && highlight_scale > 1.0) {
-            for (var i = 0; i < 4; i++) {
-                let hover_offset = offsets[i] * highlight_scale;
-                let neighbor_z = prepass_view_z(uv_noise_px + hover_offset);
-                let diff = center_z - neighbor_z;
-                if (diff > threshold) {
-                    is_silhouette = true;
-                    at_depth_boundary = true;
-                    break;
-                }
-                if (-diff > threshold) {
-                    let neighbor_alpha = prepass_normal_raw(uv_noise_px + hover_offset).a;
-                    if (neighbor_alpha >= 0.1667) {
-                        at_depth_boundary = true;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -429,14 +431,6 @@ fn fragment(
                 break;
             }
         }
-        if (!is_crease && center_is_highlight && highlight_scale > 1.0) {
-            for (var j = 0; j < 4; j++) {
-                if (check_crease(uv_noise_px, offsets[j] * highlight_scale)) {
-                    is_crease = true;
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -447,6 +441,9 @@ fn fragment(
     } else if (is_crease) {
         edge = 1.0;
         resolved_edge_color = ed_uniform.crease_color;
+    }
+    if (at_highlight_contour) {
+        edge = 1.0;
     }
 
 @if(ENABLE_COLOR) {
@@ -511,8 +508,8 @@ fn fragment(
 }
 }
 
-    // HIGHLIGHT accent (mask code 2/3): this entity's edges — silhouette,
-    // crease, or color — are drawn in highlight_color (hover/selection).
+    // HIGHLIGHT accent (mask code 2/3): the PixelArt operator draws it on the
+    // entity's outer contour only; the other operators on all its edges.
     // Ownership: positive-axis kernels (Sobel/RobertsCross always; the color
     // detector in EVERY operator) can detect an object's left/top edge on the
     // NEIGHBOR fragment, so the center sample may belong to the background —
@@ -524,9 +521,8 @@ fn fragment(
         var highlight_owner = is_highlight_mask(center_mask_alpha);
         var probe_t = 0.0;
 @if(OPERATOR_PIXEL_ART) {
-        if (edge_from_color) {
-            probe_t = max(ed_uniform.color_thickness, 1.0);
-        }
+        // The contour alone takes the accent; inner edges keep their own colour.
+        highlight_owner = at_highlight_contour;
 } @else {
         probe_t = max(max(ed_uniform.depth_thickness, ed_uniform.normal_thickness), 1.0);
 @if(ENABLE_COLOR) {
@@ -551,6 +547,17 @@ fn fragment(
                 mix(resolved_edge_color.rgb, own * ed_uniform.tone_color.rgb, ed_uniform.source_tone),
                 resolved_edge_color.a,
             );
+        }
+    }
+
+    // An emitter takes no ink line: a lantern a few pixels wide is all edge, and
+    // a line over it hid its glow (romance #907). A hover contour may cross it.
+    // Emitters burn at several times their colour; deband dither (~1/255) and a
+    // hover's surface tint stay below this bar, so bright surfaces keep their ink.
+    if (edge > 0.0 && !at_highlight_contour) {
+        let lit = textureSampleLevel(screen_texture, filtering_sampler, uv_px, 0.0).rgb;
+        if (max(lit.r, max(lit.g, lit.b)) > EMITTER_LEVEL) {
+            edge = 0.0;
         }
     }
 
@@ -585,8 +592,9 @@ fn fragment(
     }
 }
 
-    // Flat surface rejection (fallback for StandardMaterial entities without custom prepass)
-    if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0) {
+    // Flat surface rejection (fallback for StandardMaterial entities without custom prepass).
+    // A hover contour stays whole: it is drawn without a depth or normal edge.
+    if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0 && !at_highlight_contour) {
         let max_thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness);
         let reject_t = ed_uniform.flat_rejection_threshold;
         var min_ny = 1.0;

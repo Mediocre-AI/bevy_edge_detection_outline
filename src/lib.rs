@@ -41,9 +41,10 @@ pub mod edge_mask {
     pub const SKIP: f32 = 0.0;
     /// Silhouette (depth) edges only — suppresses crease (normal) edges.
     pub const SILHOUETTE_ONLY: f32 = 1.0 / 3.0;
-    /// Both edge types, drawn in `EdgeDetection::highlight_color` instead of
-    /// the normal silhouette/crease colors — per-entity hover/selection
-    /// accent (e.g. gold outline on the hovered unit/model).
+    /// Both edge types as usual, plus the per-entity hover/selection accent in
+    /// `EdgeDetection::highlight_color`: under the PixelArt operator only on the
+    /// entity's outer contour (its pixels that touch anything that is not it),
+    /// under the others on all its edges.
     pub const HIGHLIGHT: f32 = 2.0 / 3.0;
     /// Both silhouette and crease edges (default for StandardMaterial).
     pub const BOTH: f32 = 1.0;
@@ -472,12 +473,12 @@ pub struct EdgeDetection {
     pub crease_color: Option<Color>,
 
     /// Accent color for entities whose prepass mask is `edge_mask::HIGHLIGHT`
-    /// (2/3): their silhouette AND crease edges are drawn in this color —
-    /// a per-entity hover/selection outline that needs no extra pass.
+    /// (2/3) — a per-entity hover/selection outline that needs no extra pass:
+    /// their outer contour under the PixelArt operator, all their edges otherwise.
     pub highlight_color: Color,
-    /// Sampling-radius multiplier used only for `edge_mask::HIGHLIGHT` pixels.
-    /// Values above 1.0 make a hovered/selected edge appear thicker without
-    /// widening the ordinary edges of every other entity in the view.
+    /// Width of the `edge_mask::HIGHLIGHT` accent: values above 1.0 make a
+    /// hovered/selected outline thicker without widening any ordinary edge. The
+    /// PixelArt operator's contour rounds it up to whole canvas pixels (1.5 → 2).
     pub highlight_thickness: f32,
 
     /// Whether to enable depth-based edge detection.
