@@ -56,6 +56,8 @@ struct EdgeDetectionUniform {
 
     block_pixel: u32,
     flat_rejection_threshold: f32,
+    source_tone: f32,
+    tone_color: vec4f,
 }
 
 // -----------------------
@@ -541,6 +543,14 @@ fn fragment(
         }
         if (highlight_owner) {
             resolved_edge_color = ed_uniform.highlight_color;
+        } else if (ed_uniform.source_tone > 0.0) {
+            // Selective outline: the line is a darker shade of the surface it
+            // is drawn on (the center sample owns the edge).
+            let own = textureSampleLevel(screen_texture, filtering_sampler, uv_px, 0.0).rgb;
+            resolved_edge_color = vec4f(
+                mix(resolved_edge_color.rgb, own * ed_uniform.tone_color.rgb, ed_uniform.source_tone),
+                resolved_edge_color.a,
+            );
         }
     }
 

@@ -500,6 +500,15 @@ pub struct EdgeDetection {
 
     /// Edge detection operator: Sobel (3x3, wider) or RobertsCross (2x2, 1px).
     pub operator: EdgeOperator,
+
+    /// How far a silhouette or crease line takes the colour of the pixel it is
+    /// drawn on (0..1): at 1 the line is that pixel's colour multiplied by
+    /// `tone_color` — a darker shade of the surface itself, the pixel-art
+    /// "selective outline". 0 = the flat line colour. Highlight lines keep
+    /// their flat colour.
+    pub source_tone: f32,
+    /// The multiplier a toned line puts on the surface colour.
+    pub tone_color: Color,
 }
 
 impl Default for EdgeDetection {
@@ -535,6 +544,9 @@ impl Default for EdgeDetection {
             flat_rejection_threshold: 0.0,
 
             operator: EdgeOperator::default(),
+
+            source_tone: 0.0,
+            tone_color: Color::srgb(0.5, 0.45, 0.6),
         }
     }
 }
@@ -563,6 +575,8 @@ pub struct EdgeDetectionUniform {
 
     pub block_pixel: u32,
     pub flat_rejection_threshold: f32,
+    pub source_tone: f32,
+    pub tone_color: LinearRgba,
 }
 
 impl From<&EdgeDetection> for EdgeDetectionUniform {
@@ -598,6 +612,8 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
 
             block_pixel: ed.block_pixel,
             flat_rejection_threshold: ed.flat_rejection_threshold,
+            source_tone: ed.source_tone.clamp(0.0, 1.0),
+            tone_color: ed.tone_color.into(),
         }
     }
 }
