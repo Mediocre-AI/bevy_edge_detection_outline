@@ -477,7 +477,8 @@ pub struct EdgeDetection {
     /// their outer contour under the PixelArt operator, all their edges otherwise.
     pub highlight_color: Color,
     /// Width of the `edge_mask::HIGHLIGHT` accent: values above 1.0 make a
-    /// hovered/selected outline thicker without widening any ordinary edge.
+    /// hovered/selected outline thicker without widening any ordinary edge. The
+    /// PixelArt operator's contour rounds it up to whole canvas pixels (1.5 → 2).
     pub highlight_thickness: f32,
 
     /// Whether to enable depth-based edge detection.

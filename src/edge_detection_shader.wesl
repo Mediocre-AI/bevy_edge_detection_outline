@@ -261,6 +261,9 @@ fn decode_edge_mask(alpha: f32) -> vec2<bool> {
     else { return vec2<bool>(true, true); }
 }
 
+/// The screen value above which a pixel counts as an emitter (romance #907).
+const EMITTER_LEVEL: f32 = 1.6;
+
 /// HIGHLIGHT code (2/3) of the mask encoding: the per-entity hover/selection
 /// accent in ed_uniform.highlight_color.
 fn is_highlight_mask(alpha: f32) -> bool {
@@ -516,15 +519,10 @@ fn fragment(
     // is fine: that boundary is visually the highlighted object's silhouette.
     if (edge > 0.0) {
         var highlight_owner = is_highlight_mask(center_mask_alpha);
-@if(OPERATOR_PIXEL_ART) {
-        // Only the contour takes the accent; inner edges keep their own colour.
-        highlight_owner = at_highlight_contour;
-}
         var probe_t = 0.0;
 @if(OPERATOR_PIXEL_ART) {
-        if (edge_from_color) {
-            probe_t = max(ed_uniform.color_thickness, 1.0);
-        }
+        // The contour alone takes the accent; inner edges keep their own colour.
+        highlight_owner = at_highlight_contour;
 } @else {
         probe_t = max(max(ed_uniform.depth_thickness, ed_uniform.normal_thickness), 1.0);
 @if(ENABLE_COLOR) {
@@ -554,9 +552,11 @@ fn fragment(
 
     // An emitter takes no ink line: a lantern a few pixels wide is all edge, and
     // a line over it hid its glow (romance #907). A hover contour may cross it.
+    // Emitters burn at several times their colour; deband dither (~1/255) and a
+    // hover's surface tint stay below this bar, so bright surfaces keep their ink.
     if (edge > 0.0 && !at_highlight_contour) {
         let lit = textureSampleLevel(screen_texture, filtering_sampler, uv_px, 0.0).rgb;
-        if (max(lit.r, max(lit.g, lit.b)) > 1.0) {
+        if (max(lit.r, max(lit.g, lit.b)) > EMITTER_LEVEL) {
             edge = 0.0;
         }
     }
@@ -592,8 +592,9 @@ fn fragment(
     }
 }
 
-    // Flat surface rejection (fallback for StandardMaterial entities without custom prepass)
-    if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0) {
+    // Flat surface rejection (fallback for StandardMaterial entities without custom prepass).
+    // A hover contour stays whole: it is drawn without a depth or normal edge.
+    if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0 && !at_highlight_contour) {
         let max_thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness);
         let reject_t = ed_uniform.flat_rejection_threshold;
         var min_ny = 1.0;
