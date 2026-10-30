@@ -3,7 +3,7 @@ use bevy::{
     asset::{embedded_asset, load_embedded_asset},
     core_pipeline::{
         Core3d, Core3dSystems, FullscreenShader,
-        core_3d::DEPTH_PREPASS_TEXTURE_SUPPORTED,
+        core_3d::{DEPTH_PREPASS_TEXTURE_SUPPORTED, main_opaque_pass_3d, main_transparent_pass_3d},
         prepass::{DepthPrepass, NormalPrepass, ViewPrepassTextures},
         tonemapping::tonemapping,
     },
@@ -80,17 +80,26 @@ impl Plugin for EdgeDetectionPlugin {
                 Render,
                 prepare_edge_detection_pipelines.in_set(RenderSystems::Prepare),
             )
-            // Render passes are plain systems in 0.19. Run after tonemapping (so we
-            // operate on tonemapped color) and before the anti-aliasing passes (so
-            // FXAA/SMAA smooth the detected edges), within the post-process stage.
+            // On a single-sampled view the outlines belong to the opaque scene: they
+            // are drawn between the opaque and transparent main passes, so particles
+            // and glass in front of an edge cover it. A multisampled view would
+            // resolve its transparent pass over that, so there the outlines go over
+            // the tonemapped image, before FXAA/SMAA smooth them.
             .add_systems(
                 Core3d,
-                edge_detection
-                    .after(tonemapping)
-                    .before(fxaa)
-                    .before(smaa)
-                    .in_set(Core3dSystems::PostProcess)
-                    .in_set(EdgeDetectionPassSet),
+                (
+                    edge_detection::<false>
+                        .after(main_opaque_pass_3d)
+                        .before(main_transparent_pass_3d)
+                        .in_set(Core3dSystems::MainPass)
+                        .in_set(EdgeDetectionPassSet),
+                    edge_detection::<true>
+                        .after(tonemapping)
+                        .before(fxaa)
+                        .before(smaa)
+                        .in_set(Core3dSystems::PostProcess)
+                        .in_set(MultisampledEdgeDetectionPassSet),
+                ),
             );
     }
 
@@ -100,13 +109,20 @@ impl Plugin for EdgeDetectionPlugin {
     }
 }
 
-/// Public [`SystemSet`] containing the edge-detection render pass in the
-/// [`Core3d`] schedule. Another post-process pass that writes the same
-/// `ViewTarget` on the same camera (e.g. a compositor) has no inherent order
-/// against this pass — the scheduler picks arbitrarily. Integrators must
-/// `configure_sets` an explicit before/after relation against this set.
+/// Public [`SystemSet`] containing the edge-detection render pass of the
+/// single-sampled views, between the opaque and transparent main passes of the
+/// [`Core3d`] schedule. A pass that draws over the opaque scene's outlines (e.g.
+/// stamped details) orders itself after this set and before
+/// `main_transparent_pass_3d`.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EdgeDetectionPassSet;
+
+/// Public [`SystemSet`] containing the edge-detection pass of the multisampled
+/// views, in the post-process stage. Another post-process pass that writes the
+/// same `ViewTarget` on the same camera has no inherent order against it —
+/// integrators `configure_sets` an explicit before/after relation.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MultisampledEdgeDetectionPassSet;
 
 // The render entity keeps a synced `EdgeDetection`, its derived
 // `EdgeDetectionUniform`, and the per-view derived `EdgeDetectionPipelineId` /
@@ -645,13 +661,14 @@ impl EdgeDetectionUniform {
 //  Render pass (a system in the `Core3d` schedule as of Bevy 0.19)
 // ──────────────────────────────────────────────
 
-/// Runs the edge-detection post-process for the current view.
+/// Runs the edge-detection pass for the current view, when its sampling matches
+/// `MULTISAMPLED` (the two placements are registered in [`EdgeDetectionPlugin`]).
 ///
 /// [`ViewQuery`] fetches the components of the view currently being rendered; if
 /// the view has no [`EdgeDetectionPipelineId`] / [`DynamicUniformIndex`] (i.e. no
 /// [`EdgeDetection`] camera component) the parameter fails validation and the
 /// system is skipped for that view — matching the old `ViewNode` behaviour.
-pub fn edge_detection(
+pub fn edge_detection<const MULTISAMPLED: bool>(
     view: ViewQuery<(
         &Msaa,
         &ViewTarget,
@@ -675,6 +692,10 @@ pub fn edge_detection(
         ed_uniform_index,
         edge_detection_pipeline_id,
     ) = view.into_inner();
+    let multisampled = *msaa != Msaa::Off;
+    if multisampled != MULTISAMPLED {
+        return;
+    }
 
     let Some(pipeline) = pipeline_cache.get_render_pipeline(edge_detection_pipeline_id.0) else {
         info!("pipeline not found");
@@ -719,7 +740,6 @@ pub fn edge_detection(
     // The reason it doesn't work is because each post_process_write will alternate the source/destination.
     // The only way to have the correct source/destination for the bind_group
     // is to make sure you get it during the pass execution.
-    let multisampled = *msaa != Msaa::Off;
     let bind_group = ctx.render_device().create_bind_group(
         "edge_detection_bind_group",
         &pipeline_cache

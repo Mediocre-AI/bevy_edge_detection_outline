@@ -140,6 +140,10 @@ Notes:
 
 ## Changelog
 
+### Unreleased
+
+- **Outlines belong to the opaque scene**: on a single-sampled view the edge pass runs between the opaque and transparent main passes (`EdgeDetectionPassSet`), so particles and glass in front of an edge are drawn over it. A multisampled view would resolve its transparent pass over that, so there the pass still runs after tonemapping (`MultisampledEdgeDetectionPassSet`).
+
 ### 0.4.0
 
 - **Bevy 0.19**: the render-graph `ViewNode` is gone — the edge pass now runs as a `Core3d` SYSTEM in `EdgeDetectionPassSet`. Order it against other ViewTarget-writing passes with `configure_sets` (see README usage).
