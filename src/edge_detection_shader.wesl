@@ -32,6 +32,13 @@ import bevy_pbr::render::view_transformations::uv_to_ndc;
 @group(0) @binding(7) var<uniform> view: View;
 @group(0) @binding(8) var<uniform> ed_uniform: EdgeDetectionUniform;
 
+// The main pass's depth so far: the prepass's surfaces and what only the main
+// pass draws (opaque particles).
+@if(MULTISAMPLED)
+@group(0) @binding(9) var scene_depth_texture: texture_depth_multisampled_2d;
+@else
+@group(0) @binding(9) var scene_depth_texture: texture_depth_2d;
+
 struct EdgeDetectionUniform {
     depth_threshold: f32,
     normal_threshold: f32,
@@ -112,6 +119,48 @@ fn prepass_depth(uv: vec2f) -> f32 {
     let depth = textureSample(depth_prepass_texture, depth_sampler, uv);
 }
     return depth;
+}
+
+fn scene_depth_at(px: vec2i) -> f32 {
+@if(MULTISAMPLED) {
+    let depth = textureLoad(scene_depth_texture, px, sample_index_i);
+} @else {
+    let depth = textureLoad(scene_depth_texture, px, 0);
+}
+    return depth;
+}
+
+fn prepass_depth_at(px: vec2i) -> f32 {
+@if(MULTISAMPLED) {
+    let depth = textureLoad(depth_prepass_texture, px, sample_index_i);
+} @else {
+    let depth = textureLoad(depth_prepass_texture, px, 0);
+}
+    return depth;
+}
+
+// Something the prepass never drew (an opaque particle) lies in front of every
+// prepass surface whose edge could land here (Bevy's reverse Z grows toward the
+// camera). The outlines belong to the prepass's surfaces, so none is drawn over
+// it. One that stands behind a surface's edge (a flame behind a hill) leaves
+// that surface's outline drawn.
+fn covered_by_main_pass_only(uv: vec2f) -> bool {
+    let last = vec2i(texture_size) - vec2i(1);
+    let px = clamp(vec2i(uv * texture_size), vec2i(0), last);
+    let scene = scene_depth_at(px);
+    if (scene <= prepass_depth_at(px) + 1e-6) {
+        return false;
+    }
+    // As far as any edge test probes (a hover contour reaches further).
+    let thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness) * max(ed_uniform.highlight_thickness, 1.0);
+    let reach = max(i32(ceil(thickness)), 1);
+    var nearest = 0.0;
+    for (var y = -reach; y <= reach; y++) {
+        for (var x = -reach; x <= reach; x++) {
+            nearest = max(nearest, prepass_depth_at(clamp(px + vec2i(x, y), vec2i(0), last)));
+        }
+    }
+    return scene > nearest + 1e-6;
 }
 
 fn prepass_view_z(uv: vec2f) -> f32 {
@@ -608,6 +657,10 @@ fn fragment(
         if (min_ny > reject_t) {
             edge = 0.0;
         }
+    }
+
+    if (edge > 0.0 && covered_by_main_pass_only(uv_px)) {
+        edge = 0.0;
     }
 
     let src = textureSample(screen_texture, filtering_sampler, uv_px);

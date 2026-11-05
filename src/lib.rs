@@ -23,7 +23,10 @@ use bevy::{
         sync_component::{SyncComponent, SyncComponentPlugin},
         sync_world::RenderEntity,
         texture::GpuImage,
-        view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+        view::{
+            ExtractedView, ViewDepthStencilTexture, ViewTarget, ViewUniform, ViewUniformOffset,
+            ViewUniforms,
+        },
     },
 };
 
@@ -78,7 +81,12 @@ impl Plugin for EdgeDetectionPlugin {
             )
             .add_systems(
                 Render,
-                prepare_edge_detection_pipelines.in_set(RenderSystems::Prepare),
+                (
+                    prepare_edge_detection_pipelines.in_set(RenderSystems::Prepare),
+                    ensure_depth_texture_binding
+                        .in_set(RenderSystems::PrepareViews)
+                        .ambiguous_with(RenderSystems::PrepareViews),
+                ),
             )
             // On a single-sampled view the outlines belong to the opaque scene: they
             // are drawn between the opaque and transparent main passes, so particles
@@ -106,6 +114,20 @@ impl Plugin for EdgeDetectionPlugin {
     fn finish(&self, app: &mut App) {
         app.sub_app_mut(RenderApp)
             .init_resource::<EdgeDetectionPipeline>();
+    }
+}
+
+/// Add `TEXTURE_BINDING` to the depth-texture usages of every extracted camera
+/// with [`EdgeDetection`], before its depth texture is made (as Bevy does for
+/// occlusion culling): the pass compares the main-pass depth with the prepass
+/// depth, so it draws no outline over what only the main pass drew in front (an
+/// opaque particle). Done each frame on the extracted camera, it holds however
+/// the main-world components were added.
+fn ensure_depth_texture_binding(mut cameras: Query<&mut Camera3d, With<EdgeDetection>>) {
+    for mut camera in &mut cameras {
+        let usages = TextureUsages::from_bits_truncate(camera.depth_texture_usages.0)
+            | TextureUsages::TEXTURE_BINDING;
+        camera.depth_texture_usages = usages.into();
     }
 }
 
@@ -190,6 +212,8 @@ impl FromWorld for EdgeDetectionPipeline {
                     uniform_buffer::<ViewUniform>(true),
                     // The uniform that will control the effect
                     uniform_buffer::<EdgeDetectionUniform>(true),
+                    // main-pass depth
+                    texture_depth_2d_multisampled(),
                 ),
             ),
         );
@@ -217,6 +241,8 @@ impl FromWorld for EdgeDetectionPipeline {
                     uniform_buffer::<ViewUniform>(true),
                     // The uniform that will control the effect
                     uniform_buffer::<EdgeDetectionUniform>(true),
+                    // main-pass depth
+                    texture_depth_2d(),
                 ),
             ),
         );
@@ -673,6 +699,7 @@ pub fn edge_detection<const MULTISAMPLED: bool>(
         &Msaa,
         &ViewTarget,
         &ViewPrepassTextures,
+        &ViewDepthStencilTexture,
         &ViewUniformOffset,
         &DynamicUniformIndex<EdgeDetectionUniform>,
         &EdgeDetectionPipelineId,
@@ -688,6 +715,7 @@ pub fn edge_detection<const MULTISAMPLED: bool>(
         msaa,
         view_target,
         prepass_textures,
+        scene_depth,
         view_uniform_index,
         ed_uniform_index,
         edge_detection_pipeline_id,
@@ -706,6 +734,10 @@ pub fn edge_detection<const MULTISAMPLED: bool>(
         (&prepass_textures.depth, &prepass_textures.normal)
     else {
         info!("depth or normal texture not found");
+        return;
+    };
+    let Some(scene_depth) = scene_depth.attachment.depth_stencil_views().depth_only_view() else {
+        info!("main-pass depth view not found");
         return;
     };
 
@@ -764,6 +796,8 @@ pub fn edge_detection<const MULTISAMPLED: bool>(
             view_uniforms_binding,
             // Set the uniform binding
             ed_uniform_binding,
+            // main-pass depth
+            scene_depth,
         )),
     );
 
