@@ -664,6 +664,11 @@ fn fragment(
     }
 
     let src = textureSample(screen_texture, filtering_sampler, uv_px);
+    // An empty texel of a transparent canvas takes no line: the compositor lays
+    // what has no depth over the scene by its alpha (blended weather, #1139).
+    if (src.a <= 0.0) {
+        return src;
+    }
     // Blend with resolved edge color, respecting its alpha for opacity control.
     var color = mix(src.rgb, resolved_edge_color.rgb, edge * resolved_edge_color.a);
 
