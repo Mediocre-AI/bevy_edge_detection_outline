@@ -4,8 +4,9 @@
 //! Three operators are supported via shader defs:
 //!   - OPERATOR_SOBEL:        3x3 Sobel filter — 8 samples per type, wider edges, stronger gradients.
 //!   - OPERATOR_ROBERTS_CROSS: 2x2 Roberts Cross — 4 samples per type, clean 1px edges.
-//!   - OPERATOR_PIXEL_ART:    UDLR 4-direction pairwise comparison — 1px guaranteed, silhouette/crease
-//!                            priority, per-entity channel mask (alpha encoding).
+//!   - OPERATOR_PIXEL_ART:    UDLR 4-direction pairwise comparison — 1px guaranteed, silhouettes drawn
+//!                            just outside the nearer surface (alpha 2 marks them for a compositor),
+//!                            per-pixel line attributes from the normal prepass.
 
 import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
 import bevy_render::view::View;
@@ -215,15 +216,26 @@ fn prepass_normal_unpack(uv: vec2f) -> vec3f {
 }
 
 fn prepass_normal(uv: vec2f) -> vec3f {
-    return prepass_normal_raw(uv).xyz;
+    return packed_normal(prepass_normal_raw(uv));
 }
 
+/// The packed normal of a raw prepass texel: an ATTRIBUTED pixel's red channel
+/// keeps only its top bits for the normal (see Line Attributes).
+fn packed_normal(raw: vec4f) -> vec3f {
+    if (raw.a >= 0.1667 && raw.a < 0.5) {
+        let normal = vec3<u32>(round(raw.rgb * 1023.0)) >> vec3<u32>(ATTR_LOW_BITS);
+        return vec3f(normal) / f32((1u << (10u - ATTR_LOW_BITS)) - 1u);
+    }
+    return raw.xyz;
+}
+
+// Loaded, not filtered: the low bits carry line attributes.
 fn prepass_normal_raw(uv: vec2f) -> vec4f {
+    let pixel_coord = clamp(vec2i(uv * texture_size), vec2i(0), vec2i(texture_size) - vec2i(1));
 @if(MULTISAMPLED) {
-    let pixel_coord = vec2i(uv * texture_size);
     let normal = textureLoad(normal_prepass_texture, pixel_coord, sample_index_i);
 } @else {
-    let normal = textureSample(normal_prepass_texture, filtering_sampler, uv);
+    let normal = textureLoad(normal_prepass_texture, pixel_coord, 0);
 }
     return normal;
 }
@@ -297,27 +309,44 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
 }
 
 // -----------------------
-// Channel Mask Decoding --
+// Line Attributes -------
 // -----------------------
 
-/// Decode the normal prepass alpha into (enable_silhouette, enable_crease).
-/// The prepass texture is Rgb10a2Unorm — alpha is TWO BITS, four codes:
-/// 0=SKIP, 1/3=SILHOUETTE_ONLY, 2/3=HIGHLIGHT (both edges plus the accent),
-/// 1=BOTH. Thresholds sit between adjacent codes.
-fn decode_edge_mask(alpha: f32) -> vec2<bool> {
-    if (alpha < 0.1667) { return vec2<bool>(false, false); }
-    else if (alpha < 0.5) { return vec2<bool>(true, false); }
-    else { return vec2<bool>(true, true); }
+// The normal prepass alpha (Rgb10a2Unorm: two bits) says who wrote a pixel
+// (`edge_mask`): 0 SKIP, no lines · 1/3 ATTRIBUTED, a pixel-art prepass: lines,
+// and in each normal channel's low bits (`line_attrs`) the flags below (red)
+// and the model the pixel belongs to (green low half, blue high half; 0 none)
+// · 1 BOTH, Bevy's own prepass: lines. 2/3 is unused. Thresholds sit between
+// the codes.
+const ATTR_LOW_BITS: u32 = 3u; // 10 - line_attrs::NORMAL_BITS
+const ATTR_SKIN: u32 = 1u;
+const ATTR_HIGHLIGHT: u32 = 2u;
+
+struct LineAttrs {
+    lines: bool,
+    skin: bool,
+    highlight: bool,
+    object: u32,
+}
+
+fn line_attrs(raw: vec4f) -> LineAttrs {
+    var attrs = LineAttrs(raw.a >= 0.1667, false, false, 0u);
+    if (attrs.lines && raw.a < 0.5) {
+        let mask = (1u << ATTR_LOW_BITS) - 1u;
+        let bits = vec3<u32>(round(raw.rgb * 1023.0)) & vec3<u32>(mask);
+        attrs.skin = (bits.r & ATTR_SKIN) != 0u;
+        attrs.highlight = (bits.r & ATTR_HIGHLIGHT) != 0u;
+        attrs.object = bits.g | (bits.b << ATTR_LOW_BITS);
+    }
+    return attrs;
+}
+
+fn line_attrs_at(uv: vec2f) -> LineAttrs {
+    return line_attrs(prepass_normal_raw(uv));
 }
 
 /// The screen value above which a pixel counts as an emitter (romance #907).
 const EMITTER_LEVEL: f32 = 1.6;
-
-/// HIGHLIGHT code (2/3) of the mask encoding: the per-entity hover/selection
-/// accent in ed_uniform.highlight_color.
-fn is_highlight_mask(alpha: f32) -> bool {
-    return alpha >= 0.5 && alpha < 0.8333;
-}
 
 // -----------------------
 // PixelArt Operator ------
@@ -331,7 +360,7 @@ fn is_highlight_mask(alpha: f32) -> bool {
 fn check_crease(uv: vec2f, offset: vec2f) -> bool {
     let n_center = prepass_normal(uv);
     let raw_neighbor = prepass_normal_raw(uv + offset);
-    let n_neighbor = raw_neighbor.xyz;
+    let n_neighbor = packed_normal(raw_neighbor);
     let diff = n_center - n_neighbor;
     if (dot(diff, diff) <= ed_uniform.normal_threshold * ed_uniform.normal_threshold) {
         return false;
@@ -387,15 +416,19 @@ fn fragment(
 
     var edge = 0.0;
     var edge_from_color = false;
+    // The pixel whose colour a toned line takes: the center, or for a
+    // silhouette the nearer neighbour whose outline lies here.
+    var line_owner_uv = uv_px;
+    var outside_line = false;
     var resolved_edge_color = ed_uniform.edge_color;
     // A HIGHLIGHT entity's outer contour: its pixels that touch anything that
     // is not it (PixelArt operator).
     var at_highlight_contour = false;
-    // Per-entity mask alpha of the CENTER pixel: silhouettes draw on the
-    // foreground side and creases tie-break within one object, so the center
-    // sample is the entity that owns whatever edge we resolve below.
-    let center_mask_alpha = prepass_normal_raw(uv_noise_px).a;
-    let center_is_highlight = is_highlight_mask(center_mask_alpha);
+    // Line attributes of the CENTER pixel. Creases tie-break within one object
+    // and section lines lie on the non-skin side, so the center owns them; a
+    // PixelArt silhouette belongs to the nearer neighbour (`line_owner_uv`).
+    let center_attrs = line_attrs_at(uv_noise_px);
+    let center_is_highlight = center_attrs.highlight;
 
 @if(OPERATOR_PIXEL_ART) {
     // PixelArt operator: UDLR pairwise comparison with silhouette/crease priority.
@@ -415,9 +448,6 @@ fn fragment(
         vec2f(px_offset.x, 0.0),   // Right
     );
 
-    // Decode per-entity edge mask from normal prepass alpha
-    let mask = decode_edge_mask(center_mask_alpha);
-
     // A hovered or selected entity (HIGHLIGHT) is outlined only where its pixels
     // meet anything that is not it — one outer contour in highlight_color, as
     // wide as highlight_thickness. Its inner lines stay ordinary edges.
@@ -425,8 +455,7 @@ fn fragment(
         let reach = i32(ceil(highlight_scale));
         for (var k = 1; k <= reach; k++) {
             for (var i = 0; i < 4; i++) {
-                let neighbor_alpha = prepass_normal_raw(uv_noise_px + offsets[i] * f32(k)).a;
-                if (!is_highlight_mask(neighbor_alpha)) {
+                if (!line_attrs_at(uv_noise_px + offsets[i] * f32(k)).highlight) {
                     at_highlight_contour = true;
                 }
             }
@@ -434,46 +463,80 @@ fn fragment(
     }
 
     var is_silhouette = false;
+    var is_section = false;
     var is_crease = false;
     var at_depth_boundary = false;
 
-    // 1) Silhouette search — directional: only foreground pixel gets the edge.
-    //    Also tracks if we're at ANY depth boundary (either side) to suppress crease.
+    // 1) Silhouette — drawn just OUTSIDE the nearer surface: the pixel beside
+    //    the nearest lined neighbour that stands in front of it by the depth
+    //    threshold takes the line in that neighbour's colour (an empty canvas
+    //    pixel included), so a small figure keeps its outermost pixels. Either
+    //    side of such a boundary draws no crease or section line.
 @if(ENABLE_DEPTH) {
-    if (mask.x) {
-        let center_z = prepass_view_z(uv_noise_px);
-        let view_z = abs(center_z);
-        let steep_adj = smoothstep(ed_uniform.steep_angle_threshold, 1.0, fresnel)
-                        * ed_uniform.steep_angle_multiplier * view_z;
-        let threshold = ed_uniform.depth_threshold * (1.0 + steep_adj);
-
-        for (var i = 0; i < 4; i++) {
-            let neighbor_z = prepass_view_z(uv_noise_px + offsets[i]);
-            let diff = center_z - neighbor_z;
-            if (diff > threshold) {
-                // Center is closer → foreground silhouette
+    let center_z = prepass_view_z(uv_noise_px);
+    var nearest_z = center_z;
+    for (var i = 0; i < 4; i++) {
+        let neighbor_uv = uv_noise_px + offsets[i];
+        if (!line_attrs_at(neighbor_uv).lines) {
+            continue;
+        }
+        let neighbor_z = prepass_view_z(neighbor_uv);
+        let neighbor_fresnel = 1.0 - saturate(dot(prepass_normal_unpack(neighbor_uv), view_direction));
+        let threshold = ed_uniform.depth_threshold * (1.0
+            + smoothstep(ed_uniform.steep_angle_threshold, 1.0, neighbor_fresnel)
+                * ed_uniform.steep_angle_multiplier * abs(neighbor_z));
+        if (neighbor_z - center_z > threshold) {
+            at_depth_boundary = true;
+            if (neighbor_z > nearest_z) {
+                nearest_z = neighbor_z;
+                line_owner_uv = neighbor_uv;
                 is_silhouette = true;
-                at_depth_boundary = true;
-                break;
             }
-            if (-diff > threshold) {
-                // Center is farther → background side of a boundary.
-                // Only suppress crease if the foreground neighbor is non-SKIP,
-                // because a SKIP neighbor won't draw its own silhouette edge.
-                let neighbor_alpha = prepass_normal_raw(uv_noise_px + offsets[i]).a;
-                if (neighbor_alpha >= 0.1667) {
-                    at_depth_boundary = true;
-                }
-            }
+        } else if (center_z - neighbor_z > threshold && center_attrs.lines) {
+            at_depth_boundary = true;
         }
     }
 }
 
-    // 2) Crease search — skip if silhouette found OR at a depth boundary.
-    //    Suppressing crease at depth boundaries prevents the background pixel
-    //    from drawing a false crease (different objects = different normals).
+    // 2) Model line — where two models meet with no depth gap (soldiers side
+    //    by side, a general before his men at a far zoom), the farther one (on
+    //    a tie the lower id) takes the nearer one's silhouette line, as above.
+    if (!is_silhouette && center_attrs.object != 0u) {
+        let model_z = prepass_view_z(uv_noise_px);
+        for (var m = 0; m < 4; m++) {
+            let other_uv = uv_noise_px + offsets[m];
+            let other = line_attrs_at(other_uv);
+            if (other.object == 0u || other.object == center_attrs.object) {
+                continue;
+            }
+            at_depth_boundary = true;
+            let other_z = prepass_view_z(other_uv);
+            if (other_z > model_z || (other_z == model_z && other.object > center_attrs.object)) {
+                is_silhouette = true;
+                line_owner_uv = other_uv;
+                break;
+            }
+        }
+    }
+
+    // 3) Section line — where skin meets anything else on one model (the face
+    //    against hair, a helmet or a collar), the other side takes a
+    //    silhouette-strength line, so the small face keeps its pixels.
+    if (!is_silhouette && !at_depth_boundary && center_attrs.lines && !center_attrs.skin) {
+        for (var s = 0; s < 4; s++) {
+            if (line_attrs_at(uv_noise_px + offsets[s]).skin) {
+                is_section = true;
+                break;
+            }
+        }
+    }
+
+    // 4) Crease search — skip on skin, and if a silhouette or section line was
+    //    found OR at a depth boundary. Suppressing crease at depth boundaries
+    //    prevents the background pixel from drawing a false crease (different
+    //    objects = different normals).
 @if(ENABLE_NORMAL) {
-    if (!is_silhouette && !at_depth_boundary && mask.y) {
+    if (!is_silhouette && !is_section && !at_depth_boundary && center_attrs.lines && !center_attrs.skin) {
         for (var j = 0; j < 4; j++) {
             if (check_crease(uv_noise_px, offsets[j])) {
                 is_crease = true;
@@ -483,8 +546,10 @@ fn fragment(
     }
 }
 
-    // 3) Type-specific color
-    if (is_silhouette) {
+    // 5) Type-specific color
+    // A highlighted model's own contour pixel stays its own (gold, at its depth).
+    outside_line = is_silhouette && !at_highlight_contour;
+    if (is_silhouette || is_section) {
         edge = 1.0;
         resolved_edge_color = ed_uniform.silhouette_color;
     } else if (is_crease) {
@@ -557,17 +622,17 @@ fn fragment(
 }
 }
 
-    // HIGHLIGHT accent (mask code 2/3): the PixelArt operator draws it on the
-    // entity's outer contour only; the other operators on all its edges.
+    // Highlight accent (`line_attrs::HIGHLIGHT`): the PixelArt operator draws it
+    // on the entity's outer contour only; the other operators on all its edges.
     // Ownership: positive-axis kernels (Sobel/RobertsCross always; the color
     // detector in EVERY operator) can detect an object's left/top edge on the
     // NEIGHBOR fragment, so the center sample may belong to the background —
-    // probe the producing kernel's footprint then. PixelArt silhouette/crease
-    // are center-owned by construction (directional foreground test /
-    // tie-break) and skip the probe. Bleed onto a touching object's boundary
-    // is fine: that boundary is visually the highlighted object's silhouette.
+    // probe the producing kernel's footprint then. The PixelArt contour is the
+    // highlighted entity's own pixel and skips the probe. Bleed onto a touching
+    // object's boundary is fine: that boundary is visually the highlighted
+    // object's silhouette.
     if (edge > 0.0) {
-        var highlight_owner = is_highlight_mask(center_mask_alpha);
+        var highlight_owner = center_is_highlight;
         var probe_t = 0.0;
 @if(OPERATOR_PIXEL_ART) {
         // The contour alone takes the accent; inner edges keep their own colour.
@@ -581,8 +646,9 @@ fn fragment(
         if (!highlight_owner && probe_t > 0.0) {
             for (var iy = -1; iy <= 1; iy++) {
                 for (var ix = -1; ix <= 1; ix++) {
-                    let a = prepass_normal_raw(uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * probe_t).a;
-                    if (is_highlight_mask(a)) { highlight_owner = true; }
+                    if (line_attrs_at(uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * probe_t).highlight) {
+                        highlight_owner = true;
+                    }
                 }
             }
         }
@@ -591,7 +657,7 @@ fn fragment(
         } else if (ed_uniform.source_tone > 0.0) {
             // Selective outline: the line is a darker shade of the surface it
             // is drawn on (the center sample owns the edge).
-            let own = textureSampleLevel(screen_texture, filtering_sampler, uv_px, 0.0).rgb;
+            let own = textureSampleLevel(screen_texture, filtering_sampler, line_owner_uv, 0.0).rgb;
             resolved_edge_color = vec4f(
                 mix(resolved_edge_color.rgb, own * ed_uniform.tone_color.rgb, ed_uniform.source_tone),
                 resolved_edge_color.a,
@@ -600,43 +666,32 @@ fn fragment(
     }
 
     // An emitter takes no ink line: a lantern a few pixels wide is all edge, and
-    // a line over it hid its glow (romance #907). A hover contour may cross it.
+    // a line over it hid its glow (romance #907); nor casts one around it — a
+    // silhouette is tested at its owner. A hover contour may cross it.
     // Emitters burn at several times their colour; deband dither (~1/255) and a
     // hover's surface tint stay below this bar, so bright surfaces keep their ink.
     if (edge > 0.0 && !at_highlight_contour) {
-        let lit = textureSampleLevel(screen_texture, filtering_sampler, uv_px, 0.0).rgb;
+        let lit = textureSampleLevel(screen_texture, filtering_sampler, line_owner_uv, 0.0).rgb;
         if (max(lit.r, max(lit.g, lit.b)) > EMITTER_LEVEL) {
             edge = 0.0;
         }
     }
 
-    // Edge mask: suppress edges on pixels marked with alpha=0.0 in normal prepass.
-    // Materials using the NoEdgeExtension write alpha=0.0 (e.g. hex tile surfaces).
-    // Standard materials write alpha=1.0 (walls, settlements, flags, armies).
-    // Check the center pixel + immediate neighbors: if ALL have mask=0, suppress.
-    //
-    // NOTE: PixelArt operator handles masking via decode_edge_mask() which supports
-    // the 4-level alpha encoding (SKIP/SILHOUETTE_ONLY/CREASE_ONLY/BOTH).
-    // This legacy suppression uses alpha < 0.5 as "no-edge", which would incorrectly
-    // suppress SILHOUETTE_ONLY (alpha=0.25). Skip it for PixelArt.
+    // SKIP pixels take no line from these operators' neighbour kernels either:
+    // a pixel whose whole neighbourhood is SKIP (terrain surfaces) is cleared.
+    // The PixelArt operator owns every edge at its center pixel and needs no pass.
 @if(!OPERATOR_PIXEL_ART) {
-    if (edge > 0.0) {
-        let center_raw = prepass_normal_raw(uv_noise_px);
-        if (center_raw.a < 0.5) {
-            // Center pixel is no-edge. Check if all neighbors are also no-edge.
-            let max_thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness);
-            var max_alpha = center_raw.a;
-            for (var iy = -1; iy <= 1; iy++) {
-                for (var ix = -1; ix <= 1; ix++) {
-                    let offset_uv = uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * max_thickness;
-                    let raw = prepass_normal_raw(offset_uv);
-                    max_alpha = max(max_alpha, raw.a);
-                }
+    if (edge > 0.0 && !center_attrs.lines) {
+        let max_thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness);
+        var any_lines = false;
+        for (var iy = -1; iy <= 1; iy++) {
+            for (var ix = -1; ix <= 1; ix++) {
+                let offset_uv = uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * max_thickness;
+                any_lines = any_lines || line_attrs_at(offset_uv).lines;
             }
-            // If all pixels in neighborhood are no-edge (alpha < 0.5), suppress
-            if (max_alpha < 0.5) {
-                edge = 0.0;
-            }
+        }
+        if (!any_lines) {
+            edge = 0.0;
         }
     }
 }
@@ -664,6 +719,21 @@ fn fragment(
     }
 
     let src = textureSample(screen_texture, filtering_sampler, uv_px);
+    // A silhouette lies outside its model, on a pixel holding nothing or a
+    // farther surface, and is a whole pixel of the model's outline. Its alpha 2
+    // (the canvas is float) marks it for the compositor, which sets it at the
+    // depth of the nearest surface beside it, so what stands in front of the
+    // model hides the model's outline too. Whole, because a line's partial
+    // coverage would let the ground show through and the scene grade tints that
+    // dark mix (it keeps pure black black); a blended particle drawn over it
+    // later leaves its alpha above 1 unless it covers it outright.
+    if (outside_line && edge > 0.0) {
+        let line_a = edge * resolved_edge_color.a;
+        if (src.a <= 0.0) {
+            return select(src, vec4f(resolved_edge_color.rgb, 2.0), line_a > 0.0);
+        }
+        return vec4f(mix(src.rgb, resolved_edge_color.rgb, line_a), 2.0);
+    }
     // An empty texel of a transparent canvas takes no line: the compositor lays
     // what has no depth over the scene by its alpha (blended weather, #1139).
     if (src.a <= 0.0) {

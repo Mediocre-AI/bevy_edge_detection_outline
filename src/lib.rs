@@ -30,27 +30,40 @@ use bevy::{
     },
 };
 
-/// Alpha-channel encoding for per-entity edge mask control.
-/// Set the normal prepass alpha to one of these values to control
-/// which edge detection algorithms apply to that entity.
+/// Normal prepass alpha: who wrote a pixel and whether it takes lines.
 ///
 /// ⚠ The normal prepass texture is `Rgb10a2Unorm` (bevy_core_pipeline
 /// `NORMAL_PREPASS_FORMAT`): alpha has TWO BITS, so exactly four codes exist
-/// — 0, 1/3, 2/3, 1. The constants below are those four codes verbatim; any
-/// other value quantizes to one of them (a former 0.50 "CREASE_ONLY" level
-/// was unrepresentable next to them and was dropped, unused, 2026-07-25).
+/// — 0, 1/3, 2/3, 1. 2/3 is unused.
 pub mod edge_mask {
-    /// Skip all edge detection for this entity (roads, water surfaces).
+    /// No lines on this pixel (terrain surfaces, holdouts, smoke).
     pub const SKIP: f32 = 0.0;
-    /// Silhouette (depth) edges only — suppresses crease (normal) edges.
-    pub const SILHOUETTE_ONLY: f32 = 1.0 / 3.0;
-    /// Both edge types as usual, plus the per-entity hover/selection accent in
-    /// `EdgeDetection::highlight_color`: under the PixelArt operator only on the
-    /// entity's outer contour (its pixels that touch anything that is not it),
-    /// under the others on all its edges.
-    pub const HIGHLIGHT: f32 = 2.0 / 3.0;
-    /// Both silhouette and crease edges (default for StandardMaterial).
+    /// Lines, and the pixel's [`super::line_attrs`] in its normal's low bits —
+    /// what a pixel-art prepass writes.
+    pub const ATTRIBUTED: f32 = 1.0 / 3.0;
+    /// Silhouette and crease lines, no attributes (Bevy's own prepass).
     pub const BOTH: f32 = 1.0;
+}
+
+/// Per-pixel line attributes of an [`edge_mask::ATTRIBUTED`] pixel, in the low
+/// bits of its normal's channels: each channel keeps its top
+/// [`NORMAL_BITS`](line_attrs::NORMAL_BITS) for the normal; red's low bits are
+/// the flags below, green's and blue's (green the low half) the model the pixel
+/// belongs to (0 = none, else 1..=[`OBJECTS`](line_attrs::OBJECTS)). A reader
+/// that ignores them sees each component within 1/128 of its packed value.
+pub mod line_attrs {
+    /// Bits of each normal channel that hold the normal itself.
+    pub const NORMAL_BITS: u32 = 7;
+    /// How many models the outline tells apart; two that share an id (one in
+    /// this many) meet with no line where their depths agree.
+    pub const OBJECTS: u32 = 63;
+    /// A skin texel: no crease lines inside the skin, and a section line on the
+    /// other side of its border (the face against hair, a helmet or a collar).
+    pub const SKIN: u32 = 1;
+    /// Part of a highlighted (hovered or selected) model: under the PixelArt
+    /// operator its outer contour takes `EdgeDetection::highlight_color`, under
+    /// the others all its edges do.
+    pub const HIGHLIGHT: u32 = 2;
 }
 
 // ──────────────────────────────────────────────
@@ -514,11 +527,11 @@ pub struct EdgeDetection {
     /// Separate color for crease (normal) edges. `None` inherits `edge_color`.
     pub crease_color: Option<Color>,
 
-    /// Accent color for entities whose prepass mask is `edge_mask::HIGHLIGHT`
-    /// (2/3) — a per-entity hover/selection outline that needs no extra pass:
-    /// their outer contour under the PixelArt operator, all their edges otherwise.
+    /// Accent color for pixels carrying `line_attrs::HIGHLIGHT` — a per-entity
+    /// hover/selection outline that needs no extra pass: their outer contour
+    /// under the PixelArt operator, all their edges otherwise.
     pub highlight_color: Color,
-    /// Width of the `edge_mask::HIGHLIGHT` accent: values above 1.0 make a
+    /// Width of the `line_attrs::HIGHLIGHT` accent: values above 1.0 make a
     /// hovered/selected outline thicker without widening any ordinary edge. The
     /// PixelArt operator's contour rounds it up to whole canvas pixels (1.5 → 2).
     pub highlight_thickness: f32,

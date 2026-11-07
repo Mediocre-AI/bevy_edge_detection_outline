@@ -23,7 +23,7 @@ A post-processing outline effect for Bevy that detects edges from depth, normals
 - **Quality controls**: Per-source thresholds and thickness values.
 - **Steep angle compensation**: Adjustable threshold and multiplier to suppress false edges on grazing surfaces.
 - **Flat surface rejection**: Suppress edges on flat surfaces (e.g. terrain tiles) based on normal Y threshold.
-- **Edge masking**: Prepass alpha channel controls which geometry receives outlines (`alpha=1.0` = outlines, `alpha=0.0` = suppressed).
+- **Edge masking and line attributes**: the normal prepass alpha says who wrote a pixel (`edge_mask`: `SKIP` = no lines, `ATTRIBUTED` = lines plus `line_attrs` in the normal's low bits — skin, highlight, model id —, `BOTH` = Bevy's own prepass). Under the PixelArt operator skin takes no creases, its border with the rest of the model a section line, two models a line where they meet, and silhouettes lie just outside the nearer surface (canvas alpha 2, for a compositor to set at that surface's depth).
 - **Stylization**: UV distortion (via noise texture), pixelation (`block_pixel`), and configurable `edge_color`.
 - **Camera prepasses**: Uses `DepthPrepass` and `NormalPrepass`.
 - **MSAA/HDR aware**: Specializes pipelines for MSAA and HDR view targets.
