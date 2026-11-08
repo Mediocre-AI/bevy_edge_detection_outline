@@ -6,7 +6,8 @@
 //!   - OPERATOR_ROBERTS_CROSS: 2x2 Roberts Cross — 4 samples per type, clean 1px edges.
 //!   - OPERATOR_PIXEL_ART:    UDLR 4-direction pairwise comparison — 1px guaranteed, silhouettes drawn
 //!                            just outside the nearer surface (alpha 2 marks them for a compositor),
-//!                            per-pixel line attributes from the normal prepass.
+//!                            selection outlines one pixel further out (alpha 3), bright inlines on
+//!                            outward folds, per-pixel line attributes from the normal prepass.
 
 import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
 import bevy_render::view::View;
@@ -59,8 +60,9 @@ struct EdgeDetectionUniform {
 
     silhouette_color: vec4f,
     crease_color: vec4f,
-    highlight_color: vec4f,
-    highlight_thickness: f32,
+    selection_colors: array<vec4f, 3>,
+    selection_thickness: f32,
+    inline_brightness: f32,
 
     block_pixel: u32,
     flat_rejection_threshold: f32,
@@ -152,8 +154,11 @@ fn covered_by_main_pass_only(uv: vec2f) -> bool {
     if (scene <= prepass_depth_at(px) + 1e-6) {
         return false;
     }
-    // As far as any edge test probes (a hover contour reaches further).
-    let thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness) * max(ed_uniform.highlight_thickness, 1.0);
+    // As far as any edge test probes (a selection outline reaches further).
+    let thickness = max(
+        max(ed_uniform.depth_thickness, ed_uniform.normal_thickness) * max(ed_uniform.selection_thickness, 1.0),
+        SELECTION_REACH,
+    );
     let reach = max(i32(ceil(thickness)), 1);
     var nearest = 0.0;
     for (var y = -reach; y <= reach; y++) {
@@ -314,32 +319,42 @@ fn detect_edge_color(uv: vec2f, thickness: f32) -> f32 {
 
 // The normal prepass alpha (Rgb10a2Unorm: two bits) says who wrote a pixel
 // (`edge_mask`): 0 SKIP, no lines · 1/3 ATTRIBUTED, a pixel-art prepass: lines,
-// and in each normal channel's low bits (`line_attrs`) the flags below (red)
-// and the model the pixel belongs to (green low half, blue high half; 0 none)
-// · 1 BOTH, Bevy's own prepass: lines. 2/3 is unused. Thresholds sit between
-// the codes.
+// and in each normal channel's low bits (`line_attrs`) the skin flag and the
+// selection category above it (red) and the model the pixel belongs to (green
+// low half, blue high half; 0 none) · 1 BOTH, Bevy's own prepass: lines. 2/3
+// is unused. Thresholds sit between the codes.
 const ATTR_LOW_BITS: u32 = 3u; // 10 - line_attrs::NORMAL_BITS
 const ATTR_SKIN: u32 = 1u;
-const ATTR_HIGHLIGHT: u32 = 2u;
+const ATTR_CATEGORY_SHIFT: u32 = 1u;
+const ATTR_CATEGORIES: u32 = 3u;
 
 struct LineAttrs {
     lines: bool,
     skin: bool,
-    highlight: bool,
+    // The selection category: 0 none, else 1..=ATTR_CATEGORIES.
+    category: u32,
     object: u32,
 }
 
 fn line_attrs(raw: vec4f) -> LineAttrs {
-    var attrs = LineAttrs(raw.a >= 0.1667, false, false, 0u);
+    var attrs = LineAttrs(raw.a >= 0.1667, false, 0u, 0u);
     if (attrs.lines && raw.a < 0.5) {
         let mask = (1u << ATTR_LOW_BITS) - 1u;
         let bits = vec3<u32>(round(raw.rgb * 1023.0)) & vec3<u32>(mask);
         attrs.skin = (bits.r & ATTR_SKIN) != 0u;
-        attrs.highlight = (bits.r & ATTR_HIGHLIGHT) != 0u;
+        attrs.category = (bits.r >> ATTR_CATEGORY_SHIFT) & ATTR_CATEGORIES;
         attrs.object = bits.g | (bits.b << ATTR_LOW_BITS);
     }
     return attrs;
 }
+
+fn selection_color(category: u32) -> vec4f {
+    return ed_uniform.selection_colors[clamp(category, 1u, ATTR_CATEGORIES) - 1u];
+}
+
+/// How far from a selected model its PixelArt outline lies: one pixel past the
+/// one-pixel silhouette.
+const SELECTION_REACH: f32 = 2.0;
 
 fn line_attrs_at(uv: vec2f) -> LineAttrs {
     return line_attrs(prepass_normal_raw(uv));
@@ -352,27 +367,108 @@ const EMITTER_LEVEL: f32 = 1.6;
 // PixelArt Operator ------
 // -----------------------
 
-/// UDLR pairwise normal comparison for crease detection.
-/// Directional tie-breaking: only marks one side to ensure 1px crease edges.
-/// If the neighbor is SKIP (alpha < 0.1667), center always wins — otherwise
-/// the edge would be lost because the SKIP side never draws edges.
+const CREASE_NONE: u32 = 0u;
+const CREASE_DARK: u32 = 1u;
+const CREASE_INLINE: u32 = 2u;
+
+fn luminance(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+fn screen_at(uv: vec2f) -> vec3f {
+    let px = clamp(vec2i(uv * texture_size), vec2i(0), vec2i(texture_size) - vec2i(1));
+    return textureLoad(screen_texture, px, 0).rgb;
+}
+
+/// UDLR pairwise normal comparison: what line the fold between this pixel and
+/// the one at `offset` puts on this pixel. One side takes it, so the line is
+/// one pixel wide. A fold inward is a dark crease on the side with the larger
+/// normal component sum; with inlines on, a fold outward is a bright inline on
+/// the brighter side as shaded (whatever light shaded it), else on the face
+/// turned more upward. If the neighbor is SKIP (alpha < 0.1667), center always
+/// takes a dark crease — the SKIP side never draws edges.
 @if(OPERATOR_PIXEL_ART)
-fn check_crease(uv: vec2f, offset: vec2f) -> bool {
+fn crease_kind(uv: vec2f, offset: vec2f) -> u32 {
     let n_center = prepass_normal(uv);
     let raw_neighbor = prepass_normal_raw(uv + offset);
     let n_neighbor = packed_normal(raw_neighbor);
     let diff = n_center - n_neighbor;
     if (dot(diff, diff) <= ed_uniform.normal_threshold * ed_uniform.normal_threshold) {
-        return false;
+        return CREASE_NONE;
     }
     // If neighbor is SKIP, center always wins (SKIP side won't draw any edge).
     if (raw_neighbor.a < 0.1667) {
-        return true;
+        return CREASE_DARK;
     }
-    // Tie-break: only mark on the pixel with larger component sum.
     let sum_c = n_center.x + n_center.y + n_center.z;
     let sum_n = n_neighbor.x + n_neighbor.y + n_neighbor.z;
-    return sum_c >= sum_n;
+    if (ed_uniform.inline_brightness > 0.0) {
+        // The visible surface of a body bulging toward the camera is a crest of
+        // its depth: across an outward fold the view-space normal turns the way
+        // the screen steps (screen y runs down, view y up). Depth is not read,
+        // so a figure's flattened canvas depth (figure_depth) does not matter.
+        let turn = (view.view_from_world * vec4f(diff * 2.0, 0.0)).xy;
+        if (dot(turn, vec2f(-offset.x, offset.y)) > 0.0) {
+            let lum_c = luminance(screen_at(uv));
+            let lum_n = luminance(screen_at(uv + offset));
+            if (abs(lum_c - lum_n) > 1e-4) {
+                return select(CREASE_NONE, CREASE_INLINE, lum_c > lum_n);
+            }
+            if (n_center.y != n_neighbor.y) {
+                return select(CREASE_NONE, CREASE_INLINE, n_center.y > n_neighbor.y);
+            }
+            return select(CREASE_NONE, CREASE_INLINE, sum_c >= sum_n);
+        }
+    }
+    // Tie-break: only mark on the pixel with larger component sum.
+    return select(CREASE_NONE, CREASE_DARK, sum_c >= sum_n);
+}
+
+/// The selection category whose outline lies on this pixel: one just past a
+/// selected model's one-pixel silhouette — the pixel touches none of a selected
+/// model's pixels but lies two steps (Manhattan) from one that is nearer than
+/// whatever this pixel and its four neighbours hold (empty canvas,
+/// a terrain holdout, a farther surface). Any nearer surface hides the ring —
+/// a model in front of the selected one, its silhouette pixel included, and
+/// the ground in front of a figure's feet. 0 = none.
+@if(OPERATOR_PIXEL_ART)
+fn selection_ring(uv: vec2f, center: LineAttrs, px_offset: vec2f) -> u32 {
+    if (center.category != 0u) {
+        return 0u;
+    }
+    let last = vec2i(texture_size) - vec2i(1);
+    var nearest = prepass_depth_at(clamp(vec2i(uv * texture_size), vec2i(0), last));
+    let beside = array<vec2f, 4>(vec2f(0.0, 1.0), vec2f(0.0, -1.0), vec2f(-1.0, 0.0), vec2f(1.0, 0.0));
+    for (var i = 0; i < 4; i++) {
+        let beside_uv = uv + beside[i] * px_offset;
+        if (line_attrs_at(beside_uv).category != 0u) {
+            return 0u;
+        }
+        // A nearer model beside this pixel owns it (its silhouette).
+        nearest = max(nearest, prepass_depth_at(clamp(vec2i(beside_uv * texture_size), vec2i(0), last)));
+    }
+    // The pixels two steps away: a selected one there puts this pixel just past
+    // its silhouette. guard for issue #1196: a fixed offset list — a double loop
+    // bounded by a uniform-derived reach found only the diagonal cells on the GPU.
+    let two_away = array<vec2f, 8>(
+        vec2f(2.0, 0.0), vec2f(-2.0, 0.0), vec2f(0.0, 2.0), vec2f(0.0, -2.0),
+        vec2f(1.0, 1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(-1.0, -1.0),
+    );
+    var category = 0u;
+    for (var k = 0; k < 8; k++) {
+        let other_uv = uv + two_away[k] * px_offset;
+        let other = line_attrs_at(other_uv);
+        if (other.category == 0u) {
+            continue;
+        }
+        // Bevy's reverse Z grows toward the camera; empty canvas is 0.
+        let depth = prepass_depth_at(clamp(vec2i(other_uv * texture_size), vec2i(0), last));
+        if (depth > nearest) {
+            nearest = depth;
+            category = other.category;
+        }
+    }
+    return category;
 }
 
 fn pixelate_uv(uv: vec2f, dims: vec2f, block_px: f32) -> vec2f {
@@ -421,46 +517,40 @@ fn fragment(
     var line_owner_uv = uv_px;
     var outside_line = false;
     var resolved_edge_color = ed_uniform.edge_color;
-    // A HIGHLIGHT entity's outer contour: its pixels that touch anything that
-    // is not it (PixelArt operator).
-    var at_highlight_contour = false;
+    // A bright inline: the line takes the lit side's own colour, brighter.
+    var is_inline = false;
     // Line attributes of the CENTER pixel. Creases tie-break within one object
     // and section lines lie on the non-skin side, so the center owns them; a
     // PixelArt silhouette belongs to the nearer neighbour (`line_owner_uv`).
     let center_attrs = line_attrs_at(uv_noise_px);
-    let center_is_highlight = center_attrs.highlight;
+    let center_is_selected = center_attrs.category != 0u;
 
 @if(OPERATOR_PIXEL_ART) {
     // PixelArt operator: UDLR pairwise comparison with silhouette/crease priority.
     let px_offset = vec2f(block_pixel, block_pixel) / texture_size;
 
-    // A HIGHLIGHT entity's contour reaches this many pixels in; ordinary edges
-    // everywhere (its inner ones included) keep the authored one-pixel checks.
-    let highlight_scale = select(
-        1.0,
-        max(ed_uniform.highlight_thickness, 1.0),
-        center_is_highlight,
-    );
+    // A selected model's outline: past its silhouette, in its category's
+    // colour, over whatever lies there. Alpha 3 marks it for the compositor,
+    // which sets it at the depth of the model it surrounds.
+    let ring = selection_ring(uv_noise_px, center_attrs, px_offset);
+    if (ring != 0u && !covered_by_main_pass_only(uv_px)) {
+        let ring_color = selection_color(ring);
+        let under = textureSample(screen_texture, filtering_sampler, uv_px);
+        if (ring_color.a <= 0.0) {
+            return under;
+        }
+        if (under.a <= 0.0) {
+            return vec4f(ring_color.rgb, 3.0);
+        }
+        return vec4f(mix(under.rgb, ring_color.rgb, ring_color.a), 3.0);
+    }
+
     let offsets = array<vec2f, 4>(
         vec2f(0.0, px_offset.y),   // Down (+y in UV space)
         vec2f(0.0, -px_offset.y),  // Up
         vec2f(-px_offset.x, 0.0),  // Left
         vec2f(px_offset.x, 0.0),   // Right
     );
-
-    // A hovered or selected entity (HIGHLIGHT) is outlined only where its pixels
-    // meet anything that is not it — one outer contour in highlight_color, as
-    // wide as highlight_thickness. Its inner lines stay ordinary edges.
-    if (center_is_highlight) {
-        let reach = i32(ceil(highlight_scale));
-        for (var k = 1; k <= reach; k++) {
-            for (var i = 0; i < 4; i++) {
-                if (!line_attrs_at(uv_noise_px + offsets[i] * f32(k)).highlight) {
-                    at_highlight_contour = true;
-                }
-            }
-        }
-    }
 
     var is_silhouette = false;
     var is_section = false;
@@ -534,30 +624,35 @@ fn fragment(
     // 4) Crease search — skip on skin, and if a silhouette or section line was
     //    found OR at a depth boundary. Suppressing crease at depth boundaries
     //    prevents the background pixel from drawing a false crease (different
-    //    objects = different normals).
+    //    objects = different normals). A bright inline outranks a dark crease
+    //    on the same pixel.
 @if(ENABLE_NORMAL) {
     if (!is_silhouette && !is_section && !at_depth_boundary && center_attrs.lines && !center_attrs.skin) {
         for (var j = 0; j < 4; j++) {
-            if (check_crease(uv_noise_px, offsets[j])) {
-                is_crease = true;
+            let kind = crease_kind(uv_noise_px, offsets[j]);
+            if (kind == CREASE_INLINE) {
+                is_inline = true;
                 break;
+            }
+            if (kind == CREASE_DARK) {
+                is_crease = true;
             }
         }
     }
 }
 
     // 5) Type-specific color
-    // A highlighted model's own contour pixel stays its own (gold, at its depth).
-    outside_line = is_silhouette && !at_highlight_contour;
+    outside_line = is_silhouette;
     if (is_silhouette || is_section) {
         edge = 1.0;
         resolved_edge_color = ed_uniform.silhouette_color;
+    } else if (is_inline) {
+        edge = 1.0;
+        let own = screen_at(uv_noise_px);
+        resolved_edge_color = vec4f(min(own * (1.0 + ed_uniform.inline_brightness), vec3f(1.0)), 1.0);
     } else if (is_crease) {
         edge = 1.0;
         resolved_edge_color = ed_uniform.crease_color;
-    }
-    if (at_highlight_contour) {
-        edge = 1.0;
     }
 
 @if(ENABLE_COLOR) {
@@ -575,10 +670,10 @@ fn fragment(
     // Sobel / Roberts Cross operators with silhouette/crease priority.
 @if(ENABLE_DEPTH) {
     var edge_depth = detect_edge_depth(uv_noise_px, ed_uniform.depth_thickness, fresnel);
-    if (edge_depth <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
+    if (edge_depth <= 0.0 && center_is_selected && ed_uniform.selection_thickness > 1.0) {
         edge_depth = detect_edge_depth(
             uv_noise_px,
-            ed_uniform.depth_thickness * ed_uniform.highlight_thickness,
+            ed_uniform.depth_thickness * ed_uniform.selection_thickness,
             fresnel,
         );
     }
@@ -591,10 +686,10 @@ fn fragment(
 @if(ENABLE_NORMAL) {
     if (edge < 1.0) {
         var edge_normal = detect_edge_normal(uv_noise_px, ed_uniform.normal_thickness);
-        if (edge_normal <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
+        if (edge_normal <= 0.0 && center_is_selected && ed_uniform.selection_thickness > 1.0) {
             edge_normal = detect_edge_normal(
                 uv_noise_px,
-                ed_uniform.normal_thickness * ed_uniform.highlight_thickness,
+                ed_uniform.normal_thickness * ed_uniform.selection_thickness,
             );
         }
         if (edge_normal > 0.0) {
@@ -607,10 +702,10 @@ fn fragment(
 @if(ENABLE_COLOR) {
     if (edge < 1.0) {
         var edge_color_val = detect_edge_color(uv_noise_px, ed_uniform.color_thickness);
-        if (edge_color_val <= 0.0 && center_is_highlight && ed_uniform.highlight_thickness > 1.0) {
+        if (edge_color_val <= 0.0 && center_is_selected && ed_uniform.selection_thickness > 1.0) {
             edge_color_val = detect_edge_color(
                 uv_noise_px,
-                ed_uniform.color_thickness * ed_uniform.highlight_thickness,
+                ed_uniform.color_thickness * ed_uniform.selection_thickness,
             );
         }
         if (edge_color_val > 0.0) {
@@ -622,38 +717,37 @@ fn fragment(
 }
 }
 
-    // Highlight accent (`line_attrs::HIGHLIGHT`): the PixelArt operator draws it
-    // on the entity's outer contour only; the other operators on all its edges.
-    // Ownership: positive-axis kernels (Sobel/RobertsCross always; the color
-    // detector in EVERY operator) can detect an object's left/top edge on the
-    // NEIGHBOR fragment, so the center sample may belong to the background —
-    // probe the producing kernel's footprint then. The PixelArt contour is the
-    // highlighted entity's own pixel and skips the probe. Bleed onto a touching
-    // object's boundary is fine: that boundary is visually the highlighted
-    // object's silhouette.
+    // Selection accent (`line_attrs` category) under the other operators: all
+    // the selected model's edges take its colour (the PixelArt operator drew its
+    // outline above). Ownership: positive-axis kernels (and the color detector)
+    // can detect an object's left/top edge on the NEIGHBOR fragment, so the
+    // center sample may belong to the background — probe the producing kernel's
+    // footprint then. Bleed onto a touching object's boundary is fine: that
+    // boundary is visually the selected object's silhouette.
     if (edge > 0.0) {
-        var highlight_owner = center_is_highlight;
-        var probe_t = 0.0;
-@if(OPERATOR_PIXEL_ART) {
-        // The contour alone takes the accent; inner edges keep their own colour.
-        highlight_owner = at_highlight_contour;
-} @else {
-        probe_t = max(max(ed_uniform.depth_thickness, ed_uniform.normal_thickness), 1.0);
+        var selected = center_attrs.category;
+@if(!OPERATOR_PIXEL_ART) {
+        var probe_t = max(max(ed_uniform.depth_thickness, ed_uniform.normal_thickness), 1.0);
 @if(ENABLE_COLOR) {
         probe_t = max(probe_t, ed_uniform.color_thickness);
 }
-}
-        if (!highlight_owner && probe_t > 0.0) {
+        if (selected == 0u) {
             for (var iy = -1; iy <= 1; iy++) {
                 for (var ix = -1; ix <= 1; ix++) {
-                    if (line_attrs_at(uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * probe_t).highlight) {
-                        highlight_owner = true;
+                    let probed = line_attrs_at(uv_noise_px + texel_size * vec2f(f32(ix), f32(iy)) * probe_t).category;
+                    if (probed != 0u) {
+                        selected = probed;
                     }
                 }
             }
         }
-        if (highlight_owner) {
-            resolved_edge_color = ed_uniform.highlight_color;
+} @else {
+        selected = 0u;
+}
+        if (selected != 0u) {
+            resolved_edge_color = selection_color(selected);
+        } else if (is_inline) {
+            // Its own colour already.
         } else if (ed_uniform.source_tone > 0.0) {
             // Selective outline: the line is a darker shade of the surface it
             // is drawn on (the center sample owns the edge).
@@ -667,10 +761,10 @@ fn fragment(
 
     // An emitter takes no ink line: a lantern a few pixels wide is all edge, and
     // a line over it hid its glow (romance #907); nor casts one around it — a
-    // silhouette is tested at its owner. A hover contour may cross it.
-    // Emitters burn at several times their colour; deband dither (~1/255) and a
-    // hover's surface tint stay below this bar, so bright surfaces keep their ink.
-    if (edge > 0.0 && !at_highlight_contour) {
+    // silhouette is tested at its owner. Emitters burn at several times their
+    // colour; deband dither (~1/255) stays below this bar, so bright surfaces
+    // keep their ink.
+    if (edge > 0.0) {
         let lit = textureSampleLevel(screen_texture, filtering_sampler, line_owner_uv, 0.0).rgb;
         if (max(lit.r, max(lit.g, lit.b)) > EMITTER_LEVEL) {
             edge = 0.0;
@@ -697,8 +791,7 @@ fn fragment(
 }
 
     // Flat surface rejection (fallback for StandardMaterial entities without custom prepass).
-    // A hover contour stays whole: it is drawn without a depth or normal edge.
-    if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0 && !at_highlight_contour) {
+    if (ed_uniform.flat_rejection_threshold > 0.0 && edge > 0.0) {
         let max_thickness = max(ed_uniform.depth_thickness, ed_uniform.normal_thickness);
         let reject_t = ed_uniform.flat_rejection_threshold;
         var min_ny = 1.0;

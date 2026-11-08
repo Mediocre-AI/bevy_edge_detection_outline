@@ -60,10 +60,14 @@ pub mod line_attrs {
     /// A skin texel: no crease lines inside the skin, and a section line on the
     /// other side of its border (the face against hair, a helmet or a collar).
     pub const SKIN: u32 = 1;
-    /// Part of a highlighted (hovered or selected) model: under the PixelArt
-    /// operator its outer contour takes `EdgeDetection::highlight_color`, under
-    /// the others all its edges do.
-    pub const HIGHLIGHT: u32 = 2;
+    /// The flag bits above [`SKIN`] hold the model's selection category: 0 for
+    /// none, else 1..=[`CATEGORIES`], whose colour is
+    /// `EdgeDetection::selection_colors[category - 1]`. Under the PixelArt
+    /// operator a selected model gets a contour of that colour just past its
+    /// silhouette, under the others all its edges take it.
+    pub const CATEGORY_SHIFT: u32 = 1;
+    /// How many selection categories a pixel can carry.
+    pub const CATEGORIES: u32 = 3;
 }
 
 // ──────────────────────────────────────────────
@@ -527,14 +531,23 @@ pub struct EdgeDetection {
     /// Separate color for crease (normal) edges. `None` inherits `edge_color`.
     pub crease_color: Option<Color>,
 
-    /// Accent color for pixels carrying `line_attrs::HIGHLIGHT` — a per-entity
-    /// hover/selection outline that needs no extra pass: their outer contour
-    /// under the PixelArt operator, all their edges otherwise.
-    pub highlight_color: Color,
-    /// Width of the `line_attrs::HIGHLIGHT` accent: values above 1.0 make a
-    /// hovered/selected outline thicker without widening any ordinary edge. The
-    /// PixelArt operator's contour rounds it up to whole canvas pixels (1.5 → 2).
-    pub highlight_thickness: f32,
+    /// The colour of each selection category a pixel can carry
+    /// ([`line_attrs::CATEGORY_SHIFT`]): category `k` takes `selection_colors[k - 1]`.
+    /// A per-model outline that needs no extra pass — under the PixelArt
+    /// operator a contour just past the model's silhouette, all its edges
+    /// under the others.
+    pub selection_colors: [Color; 3],
+    /// How much the Sobel and RobertsCross operators widen a selected model's
+    /// edges. The PixelArt operator's selection outline is always one pixel,
+    /// just outside the model's one-pixel silhouette.
+    pub selection_thickness: f32,
+
+    /// Bright inlines (PixelArt operator): where a model's surface folds
+    /// outward (a ridge, the edge of an armour plate) the brighter of the two
+    /// faces takes a line of its own colour times `1 + inline_brightness`
+    /// (kept below 1), in place of the dark crease. 0 = every crease stays
+    /// dark. A fold inward keeps its dark crease.
+    pub inline_brightness: f32,
 
     /// Whether to enable depth-based edge detection.
     /// If `true`, edges will be detected based on depth variations.
@@ -560,7 +573,7 @@ pub struct EdgeDetection {
     /// How far a silhouette or crease line takes the colour of the pixel it is
     /// drawn on (0..1): at 1 the line is that pixel's colour multiplied by
     /// `tone_color` — a darker shade of the surface itself, the pixel-art
-    /// "selective outline". 0 = the flat line colour. Highlight lines keep
+    /// "selective outline". 0 = the flat line colour. Selection outlines keep
     /// their flat colour.
     pub source_tone: f32,
     /// The multiplier a toned line puts on the surface colour.
@@ -587,9 +600,13 @@ impl Default for EdgeDetection {
             edge_color: Color::BLACK,
             silhouette_color: None,
             crease_color: None,
-            // 잘 보이는 골드 — hover/선택 하이라이트의 기본값.
-            highlight_color: Color::srgb(0.95, 0.72, 0.12),
-            highlight_thickness: 1.0,
+            selection_colors: [
+                Color::srgb(0.95, 0.72, 0.12),
+                Color::WHITE,
+                Color::srgb(0.9, 0.12, 0.1),
+            ],
+            selection_thickness: 1.0,
+            inline_brightness: 0.0,
 
             enable_depth: true,
             enable_normal: true,
@@ -626,8 +643,9 @@ pub struct EdgeDetectionUniform {
 
     pub silhouette_color: LinearRgba,
     pub crease_color: LinearRgba,
-    pub highlight_color: LinearRgba,
-    pub highlight_thickness: f32,
+    pub selection_colors: [Vec4; 3],
+    pub selection_thickness: f32,
+    pub inline_brightness: f32,
 
     pub block_pixel: u32,
     pub flat_rejection_threshold: f32,
@@ -663,8 +681,9 @@ impl From<&EdgeDetection> for EdgeDetectionUniform {
                 .map(|c| c.into())
                 .unwrap_or(edge_linear),
             crease_color: ed.crease_color.map(|c| c.into()).unwrap_or(edge_linear),
-            highlight_color: ed.highlight_color.into(),
-            highlight_thickness: ed.highlight_thickness,
+            selection_colors: ed.selection_colors.map(|c| LinearRgba::from(c).to_vec4()),
+            selection_thickness: ed.selection_thickness,
+            inline_brightness: ed.inline_brightness.max(0.0),
 
             block_pixel: ed.block_pixel,
             flat_rejection_threshold: ed.flat_rejection_threshold,
